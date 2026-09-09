@@ -1,6 +1,6 @@
 [project]
 name = "litellm"
-version = "1.84.0"
+version = "1.84.0+agite.1"
 description = "Library to easily interface with LLM API providers"
 readme = "README.md"
 requires-python = ">=3.10, <3.14"
@@ -10,6 +10,7 @@ authors = [
     { name = "BerriAI" },
 ]
 dependencies = [
+    "filelock>=3.29.7,<4.0",
     # Ranges (not exact pins) so SDK consumers can coexist with their other
     # deps. Reproducibility for our Docker/CI comes from `uv.lock`.
     # When changing a floor, verify it installs + imports on every supported

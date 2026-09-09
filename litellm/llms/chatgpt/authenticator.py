@@ -1,13 +1,17 @@
 import base64
 import json
+import math
 import os
+import tempfile
 import time
-from typing import Any, Dict, Optional
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, Optional, Union
 
 import httpx
+from filelock import FileLock, Timeout
 
 from litellm._logging import verbose_logger
-from litellm.llms.custom_httpx.http_handler import _get_httpx_client
+from litellm.llms.custom_httpx.http_handler import HTTPHandler, _get_httpx_client
 
 from .common_utils import (
     CHATGPT_API_BASE,
@@ -29,15 +33,33 @@ DEVICE_CODE_POLL_SLEEP_SECONDS = 5
 
 
 class Authenticator:
-    def __init__(self) -> None:
-        self.token_dir = os.getenv(
+    def __init__(
+        self,
+        *,
+        token_dir: Optional[str] = None,
+        auth_file: Optional[str] = None,
+        non_interactive: Optional[bool] = None,
+        http_client: Optional[Union[httpx.Client, HTTPHandler]] = None,
+        lock_timeout: float = 60,
+    ) -> None:
+        self.token_dir = token_dir or os.getenv(
             "CHATGPT_TOKEN_DIR",
             os.path.expanduser("~/.config/litellm/chatgpt"),
         )
-        self.auth_file = os.path.join(
-            self.token_dir, os.getenv("CHATGPT_AUTH_FILE", "auth.json")
+        filename = auth_file or os.getenv("CHATGPT_AUTH_FILE", "auth.json")
+        if filename in (".", "..") or os.path.basename(filename) != filename:
+            raise ValueError("ChatGPT auth filename must remain inside token_dir")
+        self.auth_file = os.path.join(self.token_dir, filename)
+        self.non_interactive = (
+            os.getenv("CHATGPT_NON_INTERACTIVE", "false").lower() == "true"
+            if non_interactive is None
+            else non_interactive
         )
+        self.http_client = http_client
         self._ensure_token_dir()
+        self._lock = FileLock(
+            self.auth_file + ".lock", timeout=lock_timeout, mode=0o600
+        )
 
     def get_api_base(self) -> str:
         return (
@@ -47,65 +69,112 @@ class Authenticator:
         )
 
     def get_access_token(self) -> str:
-        auth_data = self._read_auth_file()
-        if auth_data:
-            access_token = auth_data.get("access_token")
-            if access_token and not self._is_token_expired(auth_data, access_token):
-                return access_token
-            refresh_token = auth_data.get("refresh_token")
-            if refresh_token:
-                try:
-                    refreshed = self._refresh_tokens(refresh_token)
-                    return refreshed["access_token"]
-                except RefreshAccessTokenError as exc:
-                    verbose_logger.warning(
-                        "ChatGPT refresh token failed, re-login required: %s", exc
-                    )
+        with self._locked_cache():
+            auth_data = self._read_auth_file()
+            if auth_data:
+                access_token = auth_data.get("access_token")
+                if (
+                    isinstance(access_token, str)
+                    and access_token
+                    and not self._is_token_expired(auth_data, access_token)
+                ):
+                    return access_token
+                refresh_token = auth_data.get("refresh_token")
+                if isinstance(refresh_token, str) and refresh_token:
+                    try:
+                        refreshed = self._refresh_tokens(refresh_token)
+                        return refreshed["access_token"]
+                    except RefreshAccessTokenError:
+                        if self.non_interactive:
+                            raise
+                        verbose_logger.warning(
+                            "ChatGPT refresh failed; re-login required"
+                        )
 
-        cooldown_remaining = self._get_device_code_cooldown_remaining(auth_data)
-        if cooldown_remaining > 0:
-            token = self._wait_for_access_token(cooldown_remaining)
-            if token:
-                return token
-
-        tokens = self._login_device_code()
-        return tokens["access_token"]
+            if self.non_interactive:
+                raise GetAccessTokenError(
+                    message="ChatGPT credentials unavailable; interactive login is disabled",
+                    status_code=401,
+                )
+            tokens = self._login_device_code()
+            return tokens["access_token"]
 
     def get_account_id(self) -> Optional[str]:
-        auth_data = self._read_auth_file()
-        if not auth_data:
-            return None
-        account_id = auth_data.get("account_id")
-        if account_id:
-            return account_id
-        id_token = auth_data.get("id_token")
-        access_token = auth_data.get("access_token")
-        derived = self._extract_account_id(id_token or access_token)
-        if derived:
-            auth_data["account_id"] = derived
-            self._write_auth_file(auth_data)
-        return derived
+        with self._locked_cache():
+            auth_data = self._read_auth_file()
+            if not auth_data:
+                return None
+            account_id = auth_data.get("account_id")
+            if account_id:
+                return account_id
+            id_token = auth_data.get("id_token")
+            access_token = auth_data.get("access_token")
+            derived = self._extract_account_id(id_token or access_token)
+            if derived:
+                auth_data["account_id"] = derived
+                self._write_auth_file(auth_data)
+            return derived
+
+    @contextmanager
+    def _locked_cache(self) -> Iterator[None]:
+        try:
+            with self._lock:
+                yield
+        except Timeout:
+            raise GetAccessTokenError(
+                message="ChatGPT cache lock timed out", status_code=408
+            ) from None
+        except OSError:
+            raise GetAccessTokenError(
+                message="ChatGPT cache access failed", status_code=500
+            ) from None
 
     def _ensure_token_dir(self) -> None:
-        if not os.path.exists(self.token_dir):
-            os.makedirs(self.token_dir, exist_ok=True)
+        os.makedirs(self.token_dir, mode=0o700, exist_ok=True)
+        os.chmod(self.token_dir, 0o700)
 
     def _read_auth_file(self) -> Optional[Dict[str, Any]]:
         try:
+            if os.path.islink(self.auth_file):
+                raise GetAccessTokenError(
+                    message="ChatGPT cache must not be a symlink", status_code=400
+                )
+            os.chmod(self.auth_file, 0o600)
             with open(self.auth_file, "r") as f:
-                return json.load(f)
-        except IOError:
+                data = json.load(f)
+                return data if isinstance(data, dict) else None
+        except FileNotFoundError:
             return None
-        except json.JSONDecodeError as exc:
-            verbose_logger.warning("Invalid ChatGPT auth file: %s", exc)
+        except (UnicodeError, json.JSONDecodeError):
+            verbose_logger.warning("Invalid ChatGPT auth file")
             return None
 
     def _write_auth_file(self, data: Dict[str, Any]) -> None:
+        temporary = None
         try:
-            with open(self.auth_file, "w") as f:
-                json.dump(data, f)
-        except IOError as exc:
-            verbose_logger.error("Failed to write ChatGPT auth file: %s", exc)
+            with tempfile.NamedTemporaryFile(
+                mode="w", dir=self.token_dir, prefix=".auth-", delete=False
+            ) as stream:
+                temporary = stream.name
+                os.chmod(temporary, 0o600)
+                json.dump(data, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.auth_file)
+            temporary = None
+            if os.name == "posix":
+                directory = os.open(self.token_dir, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+        except OSError:
+            raise GetAccessTokenError(
+                message="Failed to persist ChatGPT credentials", status_code=500
+            ) from None
+        finally:
+            if temporary is not None:
+                os.unlink(temporary)
 
     def _is_token_expired(self, auth_data: Dict[str, Any], access_token: str) -> bool:
         expires_at = auth_data.get("expires_at")
@@ -114,7 +183,11 @@ class Authenticator:
             if expires_at:
                 auth_data["expires_at"] = expires_at
                 self._write_auth_file(auth_data)
-        if expires_at is None:
+        if (
+            isinstance(expires_at, bool)
+            or not isinstance(expires_at, (int, float))
+            or not math.isfinite(expires_at)
+        ):
             return True
         return time.time() >= float(expires_at) - TOKEN_EXPIRY_SKEW_SECONDS
 
@@ -174,7 +247,7 @@ class Authenticator:
 
     def _request_device_code(self) -> Dict[str, str]:
         try:
-            client = _get_httpx_client()
+            client = self.http_client or _get_httpx_client()
             resp = client.post(
                 CHATGPT_DEVICE_CODE_URL,
                 json={"client_id": CHATGPT_CLIENT_ID},
@@ -209,7 +282,7 @@ class Authenticator:
     def _poll_for_authorization_code(
         self, device_code: Dict[str, str]
     ) -> Dict[str, str]:
-        client = _get_httpx_client()
+        client = self.http_client or _get_httpx_client()
         interval = int(device_code.get("interval", "5"))
         start_time = time.time()
         while time.time() - start_time < DEVICE_CODE_TIMEOUT_SECONDS:
@@ -259,7 +332,7 @@ class Authenticator:
 
     def _exchange_code_for_tokens(self, code_data: Dict[str, str]) -> Dict[str, str]:
         try:
-            client = _get_httpx_client()
+            client = self.http_client or _get_httpx_client()
             redirect_uri = f"{CHATGPT_AUTH_BASE}/deviceauth/callback"
             body = (
                 "grant_type=authorization_code"
@@ -301,9 +374,10 @@ class Authenticator:
 
     def _refresh_tokens(self, refresh_token: str) -> Dict[str, str]:
         try:
-            client = _get_httpx_client()
+            client = self.http_client or _get_httpx_client()
             resp = client.post(
                 CHATGPT_OAUTH_TOKEN_URL,
+                timeout=30,
                 json={
                     "client_id": CHATGPT_CLIENT_ID,
                     "grant_type": "refresh_token",
@@ -315,20 +389,25 @@ class Authenticator:
             data = resp.json()
         except httpx.HTTPStatusError as exc:
             raise RefreshAccessTokenError(
-                message=f"Refresh token failed: {exc}",
+                message="ChatGPT credential refresh rejected",
                 status_code=exc.response.status_code,
             )
-        except Exception as exc:
+        except Exception:
             raise RefreshAccessTokenError(
-                message=f"Refresh token failed: {exc}",
+                message="ChatGPT credential refresh failed",
                 status_code=400,
-            )
+            ) from None
 
-        access_token = data.get("access_token")
-        id_token = data.get("id_token")
-        if not access_token or not id_token:
+        access_token = data.get("access_token") if isinstance(data, dict) else None
+        id_token = data.get("id_token") if isinstance(data, dict) else None
+        if (
+            not isinstance(access_token, str)
+            or not access_token
+            or not isinstance(id_token, str)
+            or not id_token
+        ):
             raise RefreshAccessTokenError(
-                message=f"Refresh response missing fields: {data}",
+                message="ChatGPT refresh response missing token fields",
                 status_code=400,
             )
 

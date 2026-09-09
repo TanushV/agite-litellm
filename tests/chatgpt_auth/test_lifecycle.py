@@ -7,6 +7,9 @@ import multiprocessing
 import os
 from pathlib import Path
 import stat
+import subprocess
+import sys
+import threading
 import time
 
 import httpx
@@ -14,7 +17,10 @@ import pytest
 from filelock import FileLock
 
 from litellm.llms.chatgpt.authenticator import Authenticator
-from litellm.llms.chatgpt.common_utils import GetAccessTokenError, RefreshAccessTokenError
+from litellm.llms.chatgpt.common_utils import (
+    GetAccessTokenError,
+    RefreshAccessTokenError,
+)
 
 
 def jwt(**claims):
@@ -26,13 +32,17 @@ def tokens(account="test-account", refresh="rotated-refresh"):
     return {
         "access_token": jwt(exp=int(time.time()) + 3600),
         "refresh_token": refresh,
-        "id_token": jwt(**{"https://api.openai.com/auth": {"chatgpt_account_id": account}}),
+        "id_token": jwt(
+            **{"https://api.openai.com/auth": {"chatgpt_account_id": account}}
+        ),
     }
 
 
 def seed(directory, *, expires=None, refresh="old-refresh", filename="auth.json"):
     directory.mkdir(parents=True, exist_ok=True)
-    record = dict(tokens(), expires_at=expires or time.time() - 1, refresh_token=refresh)
+    record = dict(
+        tokens(), expires_at=expires or time.time() - 1, refresh_token=refresh
+    )
     path = directory / filename
     path.write_text(json.dumps(record))
     return path
@@ -40,8 +50,10 @@ def seed(directory, *, expires=None, refresh="old-refresh", filename="auth.json"
 
 def auth(directory, handler, **kwargs):
     return Authenticator(
-        token_dir=str(directory), non_interactive=True,
-        http_client=httpx.Client(transport=httpx.MockTransport(handler)), **kwargs,
+        token_dir=str(directory),
+        non_interactive=True,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        **kwargs,
     )
 
 
@@ -59,7 +71,9 @@ def test_valid_cache_is_private_and_uses_no_network(tmp_path):
 
 
 @pytest.mark.parametrize("remaining", [-100, 30])
-def test_refresh_is_persisted_before_return_and_reused_after_restart(tmp_path, remaining):
+def test_refresh_is_persisted_before_return_and_reused_after_restart(
+    tmp_path, remaining
+):
     cache = seed(tmp_path / "cache", expires=time.time() + remaining)
     response = tokens("second-account")
     requests = []
@@ -82,7 +96,9 @@ def test_refresh_is_persisted_before_return_and_reused_after_restart(tmp_path, r
     assert len(requests) == 1
 
 
-@pytest.mark.parametrize("contents", [None, "not json", "[]", "{}", '{"expires_at":"broken"}'])
+@pytest.mark.parametrize(
+    "contents", [None, "not json", "[]", "{}", '{"expires_at":"broken"}']
+)
 def test_missing_or_malformed_cache_fails_without_interactive_login(tmp_path, contents):
     directory = tmp_path / "cache"
     directory.mkdir()
@@ -92,7 +108,10 @@ def test_missing_or_malformed_cache_fails_without_interactive_login(tmp_path, co
         auth(directory, no_network).get_access_token()
 
 
-@pytest.mark.parametrize("status,body", [(401, {"error": "secret-marker"}), (200, {"access_token": "secret-marker"})])
+@pytest.mark.parametrize(
+    "status,body",
+    [(401, {"error": "secret-marker"}), (200, {"access_token": "secret-marker"})],
+)
 def test_refresh_failure_is_redacted_and_does_not_fall_back(tmp_path, status, body):
     cache = seed(tmp_path / "cache")
     before = cache.read_bytes()
@@ -149,6 +168,7 @@ def process_refresh(directory, counter):
             stream.write("refresh\n")
         time.sleep(0.1)
         return httpx.Response(200, json=tokens())
+
     auth(Path(directory), refresh).get_access_token()
 
 
@@ -157,7 +177,10 @@ def test_separate_processes_refresh_only_once(tmp_path):
     cache = seed(tmp_path / "cache")
     counter = tmp_path / "requests"
     context = multiprocessing.get_context("fork")
-    processes = [context.Process(target=process_refresh, args=(str(cache.parent), str(counter))) for _ in range(4)]
+    processes = [
+        context.Process(target=process_refresh, args=(str(cache.parent), str(counter)))
+        for _ in range(4)
+    ]
     for process in processes:
         process.start()
     for process in processes:
@@ -188,3 +211,71 @@ def test_explicit_filename_selects_one_cache(tmp_path):
 def test_cache_filename_cannot_escape_private_directory(tmp_path, filename):
     with pytest.raises(ValueError, match="filename"):
         auth(tmp_path / "cache", no_network, auth_file=filename)
+
+
+def test_native_default_constructor_uses_headless_environment_after_restart(tmp_path):
+    cache = seed(tmp_path / "cache", expires=time.time() + 3600)
+    environment = dict(
+        os.environ, CHATGPT_TOKEN_DIR=str(cache.parent), CHATGPT_NON_INTERACTIVE="true"
+    )
+    program = (
+        "from litellm.llms.chatgpt.authenticator import Authenticator; "
+        "from litellm.llms.chatgpt.common_utils import GetAccessTokenError; "
+        "auth=Authenticator(); assert auth.non_interactive; "
+        "assert auth.get_access_token(); print('cached-auth-ok')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "cached-auth-ok"
+    cache.unlink()
+    missing = subprocess.run(
+        [sys.executable, "-c", program],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert missing.returncode != 0
+    assert "interactive login is disabled" in missing.stderr
+    assert "Sign in" not in missing.stdout
+
+
+def test_atomic_replacement_never_exposes_partial_json(tmp_path):
+    cache = seed(tmp_path / "cache")
+    stop = threading.Event()
+    reads = []
+    failures = []
+
+    def reader():
+        while not stop.is_set():
+            try:
+                reads.append(json.loads(cache.read_text())["access_token"])
+            except Exception as error:
+                failures.append(type(error).__name__)
+
+    def refresh(request):
+        response = tokens()
+        response["access_token"] = jwt(exp=int(time.time()) + 30, padding="x" * 100_000)
+        return httpx.Response(200, json=response)
+
+    client = auth(cache.parent, refresh)
+    thread = threading.Thread(target=reader)
+    thread.start()
+    try:
+        for _ in range(12):
+            client.get_access_token()
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+    assert reads
+    assert not failures
+    assert sorted(p.name for p in cache.parent.iterdir()) == [
+        "auth.json",
+        "auth.json.lock",
+    ]
