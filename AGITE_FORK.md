@@ -30,7 +30,7 @@ existing LiteLLM flat JSON format; no desktop-cache converter is included.
 
 ## Verification and maintenance
 
-Run `python -m pytest -q tests/chatgpt_auth/test_lifecycle.py`. These tests use
+Run `python -m pytest -q tests/test_litellm/llms/chatgpt`. These tests use
 disposable credentials, the real filesystem, subprocesses and HTTP transports;
 they do not patch production methods. Audit both the fork's complete dependency
 resolution and upstream `litellm==1.84.0`: PyPI advisory lookup does not recognize
