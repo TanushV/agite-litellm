@@ -792,36 +792,41 @@ class BaseLLMHTTPHandler:
             logging_obj=logging_obj,
         )
 
-        if fake_stream is True:
-            model_response: ModelResponse = provider_config.transform_response(
-                model=model,
-                raw_response=response,
-                model_response=litellm.ModelResponse(),
-                logging_obj=logging_obj,
-                request_data=data,
-                messages=messages,
-                optional_params=optional_params,
-                litellm_params=litellm_params,
-                encoding=None,
-                json_mode=json_mode,
+        try:
+            if fake_stream is True:
+                model_response: ModelResponse = provider_config.transform_response(
+                    model=model,
+                    raw_response=response,
+                    model_response=litellm.ModelResponse(),
+                    logging_obj=logging_obj,
+                    request_data=data,
+                    messages=messages,
+                    optional_params=optional_params,
+                    litellm_params=litellm_params,
+                    encoding=None,
+                    json_mode=json_mode,
+                )
+
+                completion_stream: Any = MockResponseIterator(
+                    model_response=model_response, json_mode=json_mode
+                )
+            else:
+                completion_stream = provider_config.get_model_response_iterator(
+                    streaming_response=response.aiter_lines(), sync_stream=False
+                )
+                completion_stream.http_response = response
+            # LOGGING
+            logging_obj.post_call(
+                input=messages,
+                api_key="",
+                original_response="first stream response received",
+                additional_args={"complete_input_dict": data},
             )
 
-            completion_stream: Any = MockResponseIterator(
-                model_response=model_response, json_mode=json_mode
-            )
-        else:
-            completion_stream = provider_config.get_model_response_iterator(
-                streaming_response=response.aiter_lines(), sync_stream=False
-            )
-        # LOGGING
-        logging_obj.post_call(
-            input=messages,
-            api_key="",
-            original_response="first stream response received",
-            additional_args={"complete_input_dict": data},
-        )
-
-        return completion_stream, response.headers
+            return completion_stream, response.headers
+        except BaseException:
+            await response.aclose()
+            raise
 
     def _add_stream_param_to_request_body(
         self,

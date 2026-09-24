@@ -1,4 +1,5 @@
 import json
+import httpx
 from abc import abstractmethod
 from typing import List, Optional, Union, cast
 
@@ -64,6 +65,17 @@ class BaseModelResponseIterator:
         self.streaming_response = streaming_response
         self.response_iterator = self.streaming_response
         self.json_mode = json_mode
+        self.http_response: Optional[httpx.Response] = None
+
+    async def aclose(self) -> None:
+        """Release the response even if the line iterator never started."""
+        try:
+            close = getattr(self.streaming_response, "aclose", None)
+            if close is not None:
+                await close()
+        finally:
+            if self.http_response is not None:
+                await self.http_response.aclose()
 
     def chunk_parser(
         self, chunk: dict

@@ -1,4 +1,4 @@
-# Maintained ChatGPT credential lifecycle
+# Maintained credential and HTTP stream lifecycle
 
 This is an explicit MIT-licensed fork of BerriAI/LiteLLM, based on `v1.84.0`
 (`e1fc955464bf493c15aef08f98e0e22bdf24d4cf`). The baseline's 1,797 shipped Python
@@ -39,3 +39,20 @@ Rebase only after rerunning lifecycle and native Responses regression tests.
 
 Build with `python -m pip wheel --no-deps .`. Install a released wheel using its
 SHA256 hash, never a moving Git branch or a startup edit of site-packages.
+
+## 1.84.0+agite.2: streamed response ownership
+
+The async HTTP chat transport transfers ownership of the open HTTP response to
+its base model iterator. `aclose()` closes both the line iterator and the response,
+including when no chunk was consumed. Construction failures close the response
+before propagating the error. The outer CustomStreamWrapper already delegates
+closure to the inner iterator; callers must close streams in a `finally` block.
+
+This fixes early timeout and cancellation leaving connections acquired on the
+OpenRouter HTTP transport. It does not introduce retries, alter provider routing,
+close clients during cache eviction or replace the transport. The shipped delta
+from agite.1 is limited to `base_model_iterator.py` and `llm_http_handler.py`.
+
+Run `tests/test_litellm/llms/custom_httpx/test_response_ownership.py` for closure
+before and after the first chunk; the runtime also tests actual loopback HTTP
+streams, cancellation, inactivity and observed versus synthetic status codes.
