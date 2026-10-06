@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 from typing_extensions import TypedDict
 
@@ -8,6 +8,7 @@ from ..utils import CompletionTokensDetails, PromptTokensDetailsWrapper, ServerT
 class UsagePerChunk(TypedDict):
     prompt_tokens: int
     completion_tokens: int
+    cost: Optional[float]
     cache_creation_input_tokens: Optional[int]
     cache_read_input_tokens: Optional[int]
     server_tool_use: Optional[ServerToolUse]

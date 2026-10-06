@@ -1,6 +1,6 @@
 [project]
 name = "litellm"
-version = "1.88.6+agite.1"
+version = "1.88.6+agite.2"
 description = "Library to easily interface with LLM API providers"
 readme = "README.md"
 requires-python = ">=3.10, <3.14"
@@ -330,4 +330,3 @@ pytest_add_cli_args = [
 [tool.coverage.run]
 source = ["litellm"]
 relative_files = true
-

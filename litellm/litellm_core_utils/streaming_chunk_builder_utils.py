@@ -503,6 +503,7 @@ class ChunkProcessor:
         return {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
+            "cost": usage_chunk.get("cost"),
             "cache_creation_input_tokens": cache_creation_input_tokens,
             "cache_read_input_tokens": cache_read_input_tokens,
             "completion_tokens_details": completion_tokens_details,
@@ -544,6 +545,7 @@ class ChunkProcessor:
         web_search_requests: Optional[int] = None
         completion_tokens_details: Optional[CompletionTokensDetails] = None
         prompt_tokens_details: Optional[PromptTokensDetailsWrapper] = None
+        cost: Optional[float] = None
         for chunk in chunks:
             usage_chunk: Optional[Usage] = None
             if "usage" in chunk:
@@ -556,6 +558,8 @@ class ChunkProcessor:
 
             if usage_chunk is not None:
                 usage_chunk_dict = self._usage_chunk_calculation_helper(usage_chunk)
+                if usage_chunk_dict["cost"] is not None:
+                    cost = usage_chunk_dict["cost"]
                 if (
                     usage_chunk_dict["prompt_tokens"] is not None
                     and usage_chunk_dict["prompt_tokens"] > 0
@@ -619,6 +623,7 @@ class ChunkProcessor:
         return UsagePerChunk(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
+            cost=cost,
             cache_creation_input_tokens=cache_creation_input_tokens,
             cache_read_input_tokens=cache_read_input_tokens,
             server_tool_use=server_tool_use,
@@ -642,6 +647,8 @@ class ChunkProcessor:
         # # Update usage information if needed
 
         calculated_usage_per_chunk = self._calculate_usage_per_chunk(chunks=chunks)
+        if calculated_usage_per_chunk["cost"] is not None:
+            returned_usage.cost = calculated_usage_per_chunk["cost"]
         prompt_tokens = calculated_usage_per_chunk["prompt_tokens"]
         completion_tokens = calculated_usage_per_chunk["completion_tokens"]
         ## anthropic prompt caching information ##
