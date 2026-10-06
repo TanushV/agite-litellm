@@ -467,6 +467,236 @@ async def test_test_model_connection_loads_config_from_router():
 
 
 @pytest.mark.asyncio
+async def test_test_model_connection_uses_model_info_id_to_disambiguate_duplicate_model_names():
+    """
+    When two deployments share the same `model_name` (e.g. wildcard
+    `openai/*`) but have different `api_base` values, clicking "Test
+    Connection" on a specific row in the UI must probe THAT row's
+    `api_base` — not whichever happens to be `deployments[0]`.
+
+    The UI passes `model_info.id` to identify the deployment the user
+    actually clicked on. The backend must use that id to look up the
+    specific deployment rather than always grabbing the first match.
+
+    Regression test for: silent fallback to deployments[0] when
+    multiple deployments share a wildcard model_name.
+    """
+    from litellm.types.router import Deployment, LiteLLM_Params
+
+    mock_request = MagicMock()
+    mock_user_api_key_dict = MagicMock()
+    mock_user_api_key_dict.user_id = "test-user"
+    mock_user_api_key_dict.token = "test-token"
+
+    mock_prisma_client = MagicMock()
+
+    deployment_a = {
+        "model_name": "openai/*",
+        "litellm_params": {
+            "model": "openai/*",
+            "api_base": "https://deployment-A-base.invalid/v1",
+            "api_key": "fake-key-A",
+        },
+        "model_info": {"id": "deployment-A-id"},
+    }
+    deployment_b = {
+        "model_name": "openai/*",
+        "litellm_params": {
+            "model": "openai/*",
+            "api_base": "https://deployment-B-base.invalid/v1",
+            "api_key": "fake-key-B",
+        },
+        "model_info": {"id": "deployment-B-id"},
+    }
+
+    mock_router = MagicMock()
+    mock_router.get_model_list.return_value = [deployment_a, deployment_b]
+
+    # Backend uses get_deployment(model_id=...) for O(1) lookup by id.
+    def _get_deployment_by_id(model_id):
+        if model_id == "deployment-A-id":
+            return Deployment(
+                model_name="openai/*",
+                litellm_params=LiteLLM_Params(**deployment_a["litellm_params"]),
+                model_info=deployment_a["model_info"],
+            )
+        if model_id == "deployment-B-id":
+            return Deployment(
+                model_name="openai/*",
+                litellm_params=LiteLLM_Params(**deployment_b["litellm_params"]),
+                model_info=deployment_b["model_info"],
+            )
+        return None
+
+    mock_router.get_deployment.side_effect = _get_deployment_by_id
+
+    mock_can_user_make_model_call = AsyncMock()
+
+    mock_health_check_result = {"status": "healthy", "response_time_ms": 50}
+    mock_ahealth_check = AsyncMock(return_value=mock_health_check_result)
+    mock_run_with_timeout = AsyncMock(return_value=mock_health_check_result)
+
+    def mock_update_params(model_info, litellm_params):
+        params = litellm_params.copy()
+        params["messages"] = [{"role": "user", "content": "test"}]
+        return params
+
+    def mock_reject_os_environ(params):
+        return None
+
+    with (
+        patch(
+            "litellm.proxy.proxy_server.prisma_client",
+            mock_prisma_client,
+        ),
+        patch(
+            "litellm.proxy.proxy_server.llm_router",
+            mock_router,
+        ),
+        patch(
+            "litellm.proxy.proxy_server.premium_user",
+            False,
+        ),
+        patch(
+            "litellm.proxy.management_endpoints.model_management_endpoints.ModelManagementAuthChecks.can_user_make_model_call",
+            mock_can_user_make_model_call,
+        ),
+        patch(
+            "litellm.proxy.health_endpoints._health_endpoints.litellm.ahealth_check",
+            mock_ahealth_check,
+        ),
+        patch(
+            "litellm.proxy.health_endpoints._health_endpoints.run_with_timeout",
+            mock_run_with_timeout,
+        ),
+        patch(
+            "litellm.proxy.health_endpoints._health_endpoints._update_litellm_params_for_health_check",
+            mock_update_params,
+        ),
+        patch(
+            "litellm.proxy.health_endpoints._health_endpoints._reject_os_environ_references",
+            mock_reject_os_environ,
+        ),
+    ):
+        # Click "Test Connection" on deployment B (NOT the first one).
+        # The UI sends only `model` + `model_info.id` — it does NOT
+        # send `api_base`/`api_key`, so the backend must resolve them
+        # from the right deployment.
+        await health_test_model_connection(
+            request=mock_request,
+            mode="chat",
+            litellm_params={"model": "openai/*"},
+            model_info={"id": "deployment-B-id"},
+            user_api_key_dict=mock_user_api_key_dict,
+        )
+
+        # The outbound health check must hit deployment B's api_base.
+        ahealth_check_call_args = mock_ahealth_check.call_args
+        assert ahealth_check_call_args is not None
+        model_params = ahealth_check_call_args.kwargs.get("model_params", {})
+
+        assert model_params.get("api_base") == (
+            "https://deployment-B-base.invalid/v1"
+        ), (
+            "Expected /health/test_connection to probe deployment B's "
+            "api_base when model_info.id='deployment-B-id' was provided. "
+            f"Got: {model_params.get('api_base')!r}. This means the "
+            "backend silently fell back to deployments[0] (A) instead "
+            "of disambiguating by model_info.id."
+        )
+        assert model_params.get("api_key") == "fake-key-B"
+
+
+@pytest.mark.asyncio
+async def test_test_model_connection_falls_back_to_deployments_zero_without_id():
+    """
+    Backwards-compat: when the request body does NOT include
+    `model_info.id`, the legacy behavior of using `deployments[0]`
+    is preserved (single-deployment case, or callers that haven't
+    been updated to pass an id).
+    """
+    mock_request = MagicMock()
+    mock_user_api_key_dict = MagicMock()
+    mock_user_api_key_dict.user_id = "test-user"
+    mock_user_api_key_dict.token = "test-token"
+
+    mock_prisma_client = MagicMock()
+
+    deployment_a = {
+        "model_name": "openai/*",
+        "litellm_params": {
+            "model": "openai/*",
+            "api_base": "https://deployment-A-base.invalid/v1",
+            "api_key": "fake-key-A",
+        },
+        "model_info": {"id": "deployment-A-id"},
+    }
+    deployment_b = {
+        "model_name": "openai/*",
+        "litellm_params": {
+            "model": "openai/*",
+            "api_base": "https://deployment-B-base.invalid/v1",
+            "api_key": "fake-key-B",
+        },
+        "model_info": {"id": "deployment-B-id"},
+    }
+
+    mock_router = MagicMock()
+    mock_router.get_model_list.return_value = [deployment_a, deployment_b]
+
+    mock_can_user_make_model_call = AsyncMock()
+    mock_health_check_result = {"status": "healthy"}
+    mock_ahealth_check = AsyncMock(return_value=mock_health_check_result)
+    mock_run_with_timeout = AsyncMock(return_value=mock_health_check_result)
+
+    def mock_update_params(model_info, litellm_params):
+        params = litellm_params.copy()
+        params["messages"] = [{"role": "user", "content": "test"}]
+        return params
+
+    def mock_reject_os_environ(params):
+        return None
+
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client", mock_prisma_client),
+        patch("litellm.proxy.proxy_server.llm_router", mock_router),
+        patch("litellm.proxy.proxy_server.premium_user", False),
+        patch(
+            "litellm.proxy.management_endpoints.model_management_endpoints.ModelManagementAuthChecks.can_user_make_model_call",
+            mock_can_user_make_model_call,
+        ),
+        patch(
+            "litellm.proxy.health_endpoints._health_endpoints.litellm.ahealth_check",
+            mock_ahealth_check,
+        ),
+        patch(
+            "litellm.proxy.health_endpoints._health_endpoints.run_with_timeout",
+            mock_run_with_timeout,
+        ),
+        patch(
+            "litellm.proxy.health_endpoints._health_endpoints._update_litellm_params_for_health_check",
+            mock_update_params,
+        ),
+        patch(
+            "litellm.proxy.health_endpoints._health_endpoints._reject_os_environ_references",
+            mock_reject_os_environ,
+        ),
+    ):
+        await health_test_model_connection(
+            request=mock_request,
+            mode="chat",
+            litellm_params={"model": "openai/*"},
+            model_info={},  # no id provided
+            user_api_key_dict=mock_user_api_key_dict,
+        )
+
+        # Without id, deployments[0] (A) should be used (legacy behavior).
+        model_params = mock_ahealth_check.call_args.kwargs.get("model_params", {})
+        assert model_params.get("api_base") == "https://deployment-A-base.invalid/v1"
+        assert model_params.get("api_key") == "fake-key-A"
+
+
+@pytest.mark.asyncio
 async def test_health_services_endpoint_datadog_llm_observability():
     """
     Verify that 'datadog_llm_observability' is accepted as a valid service
@@ -1593,3 +1823,96 @@ def test_clean_endpoint_data_strips_credentials_keeps_routing_fields():
     assert "aws_access_key_id" not in cleaned
     assert cleaned.get("api_base") == "https://example.test/v1"
     assert cleaned.get("api_version") == "2024-10-21"
+
+
+class TestConfigBaseForHealthCheck:
+    """A request that sets its own connection fields gets a base without the
+    configuration's credentials; anything it leaves unset still comes from
+    the configuration."""
+
+    CONFIG = {
+        "model": "openai/gpt-4o",
+        "api_key": "sk-configured",
+        "api_base": "https://configured.example/v1",
+        "vertex_credentials": "configured-creds",
+        "rpm": 100,
+    }
+
+    def _base(self, config, request, allow_client_side_credentials=False):
+        from litellm.proxy.health_endpoints._health_endpoints import (
+            _config_base_for_health_check,
+        )
+
+        return _config_base_for_health_check(
+            config, request, allow_client_side_credentials=allow_client_side_credentials
+        )
+
+    def test_request_without_connection_fields_inherits_config(self):
+        base = self._base(self.CONFIG, {"model": "openai/gpt-4o"})
+        assert base["api_key"] == "sk-configured"
+        assert base["api_base"] == "https://configured.example/v1"
+
+    def test_request_setting_api_base_does_not_inherit_config_credentials(self):
+        base = self._base(self.CONFIG, {"api_base": "https://caller.example/v1"})
+        assert "api_key" not in base
+        assert "api_base" not in base
+        assert "vertex_credentials" not in base
+        assert base["rpm"] == 100
+
+    def test_add_model_flow_keeps_its_own_credentials(self):
+        """Adding a second deployment for an already-configured name sends a
+        complete connection; it is tested as sent, not as configured."""
+        request = {
+            "model": "openai/gpt-4o",
+            "api_base": "https://new-deployment.example/v1",
+            "api_key": "sk-new-deployment",
+        }
+        merged = {**self._base(self.CONFIG, request), **request}
+        assert merged["api_base"] == "https://new-deployment.example/v1"
+        assert merged["api_key"] == "sk-new-deployment"
+        assert "sk-configured" not in str(merged)
+
+    def test_destination_override_without_own_key_inherits_no_credential(self):
+        """A request that redirects the destination but supplies no credential
+        of its own gets none from the configuration."""
+        request = {"api_base": "https://elsewhere.example"}
+        merged = {**self._base(self.CONFIG, request), **request}
+        assert "api_key" not in merged
+        assert "sk-configured" not in str(merged)
+
+    def test_non_api_base_destination_field_also_drops_credentials(self):
+        base = self._base(
+            {**self.CONFIG, "aws_secret_access_key": "configured-secret"},
+            {"aws_bedrock_runtime_endpoint": "https://caller.example"},
+        )
+        assert "api_key" not in base
+        assert "aws_secret_access_key" not in base
+
+    def test_opt_in_restores_configured_credentials_under_a_request_endpoint(self):
+        """With general_settings.allow_client_side_credentials enabled, a request
+        may pair its own endpoint with the configured credentials, as before."""
+        base = self._base(
+            self.CONFIG,
+            {"api_base": "https://caller.example/v1"},
+            allow_client_side_credentials=True,
+        )
+        assert base["api_key"] == "sk-configured"
+
+    def test_stored_credential_reference_is_dropped_with_the_credentials(self):
+        """A stored-credential name resolves to the same secrets downstream, so a
+        request that redirects the destination must not keep it either."""
+        config = {**self.CONFIG, "litellm_credential_name": "OpenAI-prod"}
+        base = self._base(config, {"api_base": "https://caller.example/v1"})
+        assert "litellm_credential_name" not in base
+        assert "api_key" not in base
+
+    def test_stored_credential_reference_kept_when_request_sets_no_connection(self):
+        """The Admin UI tests a configured model by naming it plus its stored
+        credential and nothing else; that keeps working."""
+        config = {**self.CONFIG, "litellm_credential_name": "OpenAI-prod"}
+        base = self._base(
+            config,
+            {"model": "openai/gpt-4o", "litellm_credential_name": "OpenAI-prod", "custom_llm_provider": "openai"},
+        )
+        assert base["litellm_credential_name"] == "OpenAI-prod"
+        assert base["api_key"] == "sk-configured"

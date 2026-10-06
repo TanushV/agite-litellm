@@ -1,4 +1,3 @@
-import json
 import os
 import sys
 
@@ -407,6 +406,54 @@ def test_stream_chunk_builder_litellm_usage_chunks():
     assert usage.total_tokens == 77
 
 
+@pytest.mark.parametrize("as_dict", [False, True])
+@pytest.mark.parametrize(
+    "costs, expected",
+    [
+        ([0.0123], 0.0123),
+        ([0.0], 0.0),
+        ([0.02, None, 0.03, None], 0.03),
+        ([None], None),
+    ],
+)
+def test_stream_usage_preserves_last_reported_cost(as_dict, costs, expected):
+    chunks = []
+    for cost in costs:
+        usage = {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}
+        if cost is not None:
+            usage["cost"] = cost
+        chunks.append({"usage": usage if as_dict else Usage(**usage)})
+    result = ChunkProcessor(chunks=chunks).calculate_usage(
+        chunks=chunks,
+        model="openrouter/deepseek/deepseek-v4.1-flash",
+        completion_output="",
+    )
+    assert getattr(result, "cost", None) == expected
+    assert result.total_tokens == 110
+
+
+def test_public_stream_builder_preserves_provider_cost():
+    chunks = [
+        ModelResponseStream(
+            id="gen-provider-cost",
+            model="openrouter/deepseek/deepseek-v4.1-flash",
+            choices=[StreamingChoices(index=0, delta=Delta(content="Hello"))],
+        ),
+        ModelResponseStream(
+            id="gen-provider-cost",
+            model="openrouter/deepseek/deepseek-v4.1-flash",
+            choices=[StreamingChoices(index=0, delta=Delta(), finish_reason="stop")],
+            usage=Usage(
+                prompt_tokens=100, completion_tokens=10, total_tokens=110, cost=0.0123
+            ),
+        ),
+    ]
+    response = stream_chunk_builder(chunks)
+    assert response.choices[0].message.content == "Hello"
+    assert response.usage.cost == 0.0123
+    assert response.usage.total_tokens == 110
+
+
 def test_get_model_from_chunks_azure_model_router():
     """
     Test that _get_model_from_chunks finds the actual model from Azure Model Router chunks.
@@ -520,7 +567,10 @@ def test_stream_chunk_builder_anthropic_web_search():
     assert usage.prompt_tokens == 50
     assert usage.completion_tokens == 27
     assert usage.total_tokens == 77
-    assert usage.server_tool_use["web_search_requests"] == 2
+    # server_tool_use must be a ServerToolUse pydantic so downstream cost-calc
+    # (which uses attribute access) works. See issue #26153.
+    assert isinstance(usage.server_tool_use, ServerToolUse)
+    assert usage.server_tool_use.web_search_requests == 2
 
 
 def test_sort_chunks_handles_dict_hidden_params_created_at():

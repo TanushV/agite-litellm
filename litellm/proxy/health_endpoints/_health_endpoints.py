@@ -5,7 +5,7 @@ import os
 import time
 import traceback
 from datetime import datetime, timedelta
-from typing import Any, Dict, Iterable, Literal, Optional, Union, cast
+from typing import Any, Dict, Final, Iterable, Literal, Mapping, Optional, Union, cast
 
 import fastapi
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -26,17 +26,25 @@ from litellm.proxy._types import (
     UserAPIKeyAuth,
     WebhookEvent,
 )
+from litellm.proxy.auth.auth_utils import (
+    _BANNED_REQUEST_BODY_PARAMS,  # pyright: ignore[reportPrivateUsage]  # one canonical list, shared with the request-body check
+)
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
 from litellm.proxy.health_check import (
     ADMIN_ONLY_HEALTH_DISPLAY_PARAMS,
     _clean_endpoint_data,
     _update_litellm_params_for_health_check,
+    health_check_filter_kwargs_from_general_settings,
     perform_health_check,
     run_with_timeout,
 )
 from litellm.proxy.middleware.in_flight_requests_middleware import (
     get_in_flight_requests,
+)
+from litellm.router_utils.clientside_credential_handler import (
+    _ADMIN_CONFIG_FIELDS_TO_CLEAR_ON_BASE_OVERRIDE,  # pyright: ignore[reportPrivateUsage]  # one canonical list, shared with the router path
+    clientside_credential_keys,
 )
 
 #### Health ENDPOINTS ####
@@ -75,6 +83,49 @@ def _reject_os_environ_references(params: dict) -> None:
             if isinstance(value, (dict, list)) and id(value) not in seen:
                 seen.add(id(value))
                 stack.append(value)
+
+
+_CONFIG_CONNECTION_FIELDS: Final[frozenset[str]] = frozenset(
+    (
+        *_ADMIN_CONFIG_FIELDS_TO_CLEAR_ON_BASE_OVERRIDE,
+        *clientside_credential_keys,
+        "litellm_credential_name",
+    )
+)
+
+
+def _config_base_for_health_check(
+    config_params: Mapping[str, object],
+    request_params: Mapping[str, object],
+    allow_client_side_credentials: bool = False,
+) -> dict[str, object]:
+    """Return the configured parameters to merge under a connection-test request.
+
+    A request that sets its own connection fields describes a connection of its
+    own, so the configuration's credentials are not carried into it: they belong
+    to the endpoint the configuration names. Anything the request does not set
+    still comes from the configuration, which is what lets a request name a
+    configured model and test it as configured.
+
+    ``litellm_credential_name`` is dropped alongside the literal credential
+    fields: it names a stored credential that ``load_credentials_from_list``
+    resolves into the same secrets further down the call, so leaving it in place
+    would reintroduce them by reference.
+
+    ``general_settings.allow_client_side_credentials`` is the existing proxy-wide
+    opt-in for callers supplying their own connection parameters. Where an admin
+    has enabled it, a request may pair its own endpoint with the configured
+    credentials, as it could before.
+    """
+    if allow_client_side_credentials:
+        return dict(config_params)
+    if not any(param in request_params for param in _BANNED_REQUEST_BODY_PARAMS):
+        return dict(config_params)
+    return {
+        key: value
+        for key, value in config_params.items()
+        if key not in _CONFIG_CONNECTION_FIELDS
+    }
 
 
 def get_callback_identifier(callback):
@@ -150,7 +201,10 @@ async def test_endpoint(request: Request):
         dict: A dictionary containing the route of the request URL.
     """
     # ping the proxy server to check if its healthy
-    return {"route": request.url.path}
+    # Inline import — auth_utils participates in a proxy import cycle.
+    from litellm.proxy.auth.auth_utils import get_request_route  # noqa: PLC0415
+
+    return {"route": get_request_route(request)}
 
 
 @router.get(
@@ -858,6 +912,7 @@ async def _perform_health_check_and_save(
     user_id,
     model_id=None,
     max_concurrency=None,
+    **perform_health_check_extra,
 ):
     """Helper function to perform health check and save results to database"""
     healthy_endpoints, unhealthy_endpoints, _ = await perform_health_check(
@@ -867,6 +922,7 @@ async def _perform_health_check_and_save(
         details=details,
         max_concurrency=max_concurrency,
         model_id=model_id,
+        **perform_health_check_extra,
     )
 
     # Optionally save health check result to database (non-blocking)
@@ -892,6 +948,37 @@ async def _perform_health_check_and_save(
         "healthy_count": len(healthy_endpoints),
         "unhealthy_count": len(unhealthy_endpoints),
     }
+
+
+def _health_endpoint_resolve_target_model_name(
+    model: Optional[str],
+    model_id: Optional[str],
+    llm_router,
+) -> Optional[str]:
+    """Map ``model_id`` (without ``model``) to ``model_name`` for live health checks."""
+    if not model_id or model:
+        return model
+    if llm_router is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": f"Model with ID {model_id} not found"},
+        )
+    try:
+        deployment = llm_router.get_deployment(model_id=model_id)
+    except Exception as e:
+        verbose_proxy_logger.error(
+            f"Error getting deployment for model_id {model_id}: {e}"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": f"Model with ID {model_id} not found"},
+        ) from e
+    if deployment is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": f"Model with ID {model_id} not found"},
+        )
+    return deployment.model_name
 
 
 @router.get("/health", tags=["health"], dependencies=[Depends(user_api_key_auth)])
@@ -920,10 +1007,15 @@ async def health_endpoint(
         background_health_checks: True
     ```
     else, the health checks will be run on models when /health is called.
+
+    To skip deployments that set ``model_info.disable_background_health_check: true``
+    on ``GET /health`` as well as in the background loop, set
+    ``general_settings.health_check_skip_disabled_background_models: true``.
     """
     import time
 
     from litellm.proxy.proxy_server import (
+        general_settings,
         health_check_concurrency,
         health_check_details,
         health_check_results,
@@ -934,35 +1026,12 @@ async def health_endpoint(
         user_model,
     )
 
+    _hc_filter = health_check_filter_kwargs_from_general_settings(general_settings)
     start_time = time.time()
 
-    # Handle model_id parameter - convert to model name for health check
-    target_model = model
-    if model_id and not model:
-        # Use get_deployment from router to find the model name
-        if llm_router is not None:
-            try:
-                deployment = llm_router.get_deployment(model_id=model_id)
-                if deployment is not None:
-                    target_model = deployment.model_name
-                else:
-                    raise HTTPException(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        detail={"error": f"Model with ID {model_id} not found"},
-                    )
-            except Exception as e:
-                verbose_proxy_logger.error(
-                    f"Error getting deployment for model_id {model_id}: {e}"
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail={"error": f"Model with ID {model_id} not found"},
-                )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={"error": f"Model with ID {model_id} not found"},
-            )
+    target_model = _health_endpoint_resolve_target_model_name(
+        model, model_id, llm_router
+    )
 
     is_admin = _is_proxy_admin(user_api_key_dict)
     model_specific_request = bool(model or model_id)
@@ -1000,6 +1069,7 @@ async def health_endpoint(
                     user_id=user_api_key_dict.user_id,
                     model_id=None,  # CLI model doesn't have model_id
                     max_concurrency=health_check_concurrency,
+                    **_hc_filter,
                 )
                 return _post_process(cli_result)
             raise HTTPException(
@@ -1085,6 +1155,7 @@ async def health_endpoint(
                 user_id=user_api_key_dict.user_id,
                 model_id=model_id,
                 max_concurrency=health_check_concurrency,
+                **_hc_filter,
             )
             return _post_process(router_result)
     except Exception as e:
@@ -1729,7 +1800,12 @@ async def test_model_connection(
     from litellm.proxy.management_endpoints.model_management_endpoints import (
         ModelManagementAuthChecks,
     )
-    from litellm.proxy.proxy_server import llm_router, premium_user, prisma_client
+    from litellm.proxy.proxy_server import (
+        general_settings,
+        llm_router,
+        premium_user,
+        prisma_client,
+    )
     from litellm.types.router import Deployment, LiteLLM_Params
 
     try:
@@ -1750,29 +1826,54 @@ async def test_model_connection(
         # Look up model configuration from router if model name is provided
         # This gets the litellm_params from proxy config (with resolved env vars)
         config_litellm_params: dict = {}
-        if model_name and llm_router is not None:
+        if llm_router is not None:
+            # Prefer disambiguation by deployment id (`model_info.id`) when
+            # the caller supplies it. This is required when multiple
+            # deployments share a `model_name` (e.g. wildcard `openai/*`
+            # with multiple `api_base` values for failover): the UI's
+            # "Test Connection" button targets a specific row, and that
+            # row's id is the only thing that uniquely identifies which
+            # deployment to probe. Without this, all duplicates collapse
+            # onto `deployments[0]`.
+            request_model_info = model_info or {}
+            request_model_id = request_model_info.get("id")
             try:
-                # First try to find by proxy model_name (e.g., "gpt-4o")
-                deployments = llm_router.get_model_list(model_name=model_name)
-
-                # If not found, try to find by litellm model name (e.g., "azure/gpt-4o")
-                if not deployments or len(deployments) == 0:
-                    all_deployments = llm_router.get_model_list(model_name=None)
-                    if all_deployments:
-                        for deployment in all_deployments:
-                            if (
-                                deployment.get("litellm_params", {}).get("model")
-                                == model_name
-                            ):
-                                deployments = [deployment]
-                                break
-
-                if deployments and len(deployments) > 0:
-                    # Use the first deployment's litellm_params as base config
-                    # These already have resolved environment variables from proxy config
-                    config_litellm_params = dict(
-                        deployments[0].get("litellm_params", {})
+                deployment_by_id = None
+                if request_model_id:
+                    deployment_by_id = llm_router.get_deployment(
+                        model_id=request_model_id
                     )
+
+                if deployment_by_id is not None:
+                    config_litellm_params = deployment_by_id.litellm_params.model_dump(
+                        exclude_none=True
+                    )
+                elif model_name:
+                    # Fall back to model_name lookup for callers (e.g. the
+                    # "Add Model" wizard, or curl) that don't supply an id.
+                    # First try to find by proxy model_name (e.g., "gpt-4o")
+                    deployments = llm_router.get_model_list(model_name=model_name)
+
+                    # If not found, try to find by litellm model name
+                    # (e.g., "azure/gpt-4o")
+                    if not deployments or len(deployments) == 0:
+                        all_deployments = llm_router.get_model_list(model_name=None)
+                        if all_deployments:
+                            for deployment in all_deployments:
+                                if (
+                                    deployment.get("litellm_params", {}).get("model")
+                                    == model_name
+                                ):
+                                    deployments = [deployment]
+                                    break
+
+                    if deployments and len(deployments) > 0:
+                        # Use the first deployment's litellm_params as base
+                        # config. These already have resolved environment
+                        # variables from proxy config.
+                        config_litellm_params = dict(
+                            deployments[0].get("litellm_params", {})
+                        )
             except Exception as e:
                 verbose_proxy_logger.debug(
                     f"Could not find model {model_name} in router: {e}. "
@@ -1780,8 +1881,17 @@ async def test_model_connection(
                 )
 
         # Merge: config params (from proxy config) as base, request params override
-        # This allows users to override specific params while using config for credentials
-        litellm_params = {**config_litellm_params, **request_litellm_params}
+        litellm_params = {
+            **_config_base_for_health_check(
+                config_litellm_params,
+                request_litellm_params,
+                allow_client_side_credentials=general_settings.get(
+                    "allow_client_side_credentials"
+                )
+                is True,
+            ),
+            **request_litellm_params,
+        }
 
         ## Auth check
         await ModelManagementAuthChecks.can_user_make_model_call(

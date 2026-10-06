@@ -2,7 +2,7 @@ import os
 import re
 import sys
 from functools import lru_cache
-from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, FrozenSet, Iterator, List, Mapping, Optional, Tuple, Union
 
 from fastapi import HTTPException, Request, status
 
@@ -10,8 +10,15 @@ import litellm
 from litellm import Router, provider_list
 from litellm._logging import verbose_proxy_logger
 from litellm.constants import STANDARD_CUSTOMER_ID_HEADERS
-from litellm.litellm_core_utils.url_utils import SSRFError, validate_url
+from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
+from litellm.litellm_core_utils.url_utils import (
+    SSRFError,
+    is_url_destination_allowed_by_host,
+    provider_url_destination_candidates,
+    validate_url,
+)
 from litellm.proxy._types import *
+from litellm.proxy.common_utils.http_parsing_utils import extract_nested_form_metadata
 from litellm.types.router import CONFIGURABLE_CLIENTSIDE_AUTH_PARAMS
 from litellm.types.utils import CustomPricingLiteLLMParams
 
@@ -212,6 +219,12 @@ _EXTRA_BANNED_OBSERVABILITY_PARAMS: FrozenSet[str] = frozenset(
     {
         "posthog_api_url",
         "phoenix_project_name",
+        "phoenix_project_name_override",
+        # Server-reserved: written exclusively by add_user_api_key_auth_to_request_metadata
+        # from the authenticated key's database record.  A caller-supplied value
+        # would survive the server merge and let an authenticated user redirect
+        # their Arize/Phoenix telemetry into arbitrary projects.
+        "user_api_key_auth_metadata",
         "wandb_api_key",
         "weave_project_id",
     }
@@ -272,6 +285,9 @@ _BANNED_REQUEST_BODY_PARAMS: Tuple[str, ...] = (
     "s3_endpoint_url",
     "sagemaker_base_url",
     "deployment_url",
+    # SDK-only field; also rejected outright in is_request_body_safe.
+    "model_list",
+    "vertex_ai_credentials",
     # Observability credentials, hosts, and project identifiers: derived
     # from the canonical ``_supported_callback_params`` allowlist so new
     # integrations are covered automatically. Sorted for stable iteration
@@ -324,6 +340,66 @@ def _check_banned_params(
         )
 
 
+_FALLBACK_FIELDS: tuple[str, ...] = (
+    "fallbacks",
+    "context_window_fallbacks",
+    "content_policy_fallbacks",
+)
+
+
+def _iter_fallback_field_values(request_body: Mapping[str, object]) -> Iterator[object]:
+    override = request_body.get("router_settings_override")
+    for source in (request_body, override):
+        if isinstance(source, Mapping):
+            for field in _FALLBACK_FIELDS:
+                yield source.get(field)
+
+
+def _iter_fallback_targets(
+    value: object, depth: int
+) -> Iterator[str | Mapping[str, object]]:
+    if depth > 2 * litellm.ROUTER_MAX_FALLBACKS:
+        raise ValueError(
+            "Rejected Request: fallback nesting exceeds the allowed validation depth."
+        )
+    if not isinstance(value, list):
+        return
+    for item in value:
+        if isinstance(item, str):
+            yield item
+        elif isinstance(item, Mapping):
+            values = tuple(item.values())
+            if not (values and all(isinstance(v, list) for v in values)):
+                yield item
+            if isinstance(item.get("model"), str):
+                for field in _FALLBACK_FIELDS:
+                    yield from _iter_fallback_targets(item.get(field), depth + 1)
+            else:
+                for target_list in values:
+                    yield from _iter_fallback_targets(target_list, depth + 1)
+
+
+def iter_request_fallback_targets(
+    request_body: Mapping[str, object],
+) -> Iterator[str | Mapping[str, object]]:
+    for value in _iter_fallback_field_values(request_body):
+        yield from _iter_fallback_targets(value, 0)
+
+
+def _reject_url_valued_fallback_target(value: str) -> None:
+    allowed_hosts = getattr(litellm, "provider_url_destination_allowed_hosts", []) or []
+    for candidate in provider_url_destination_candidates(value):
+        if not candidate.lower().startswith(("http://", "https://")):
+            continue
+        if is_url_destination_allowed_by_host(candidate, allowed_hosts):
+            continue
+        raise ValueError(
+            f"Rejected Request: URL-valued fallback destination '{value}' is not allowed. "
+            "Configure custom endpoints with api_base instead, or add the destination host to "
+            "`provider_url_destination_allowed_hosts` in litellm_settings."
+        )
+
+
 def is_request_body_safe(
     request_body: dict, general_settings: dict, llm_router: Optional[Router], model: str
 ) -> bool:
@@ -352,6 +428,10 @@ def is_request_body_safe(
     ``litellm_embedding_config.api_base`` (VERIA-6) without exposing a
     recursion-depth DoS surface.
     """
+    if "model_list" in request_body:
+        raise ValueError(
+            "Rejected Request: model_list is not allowed in the request body."
+        )
     _check_banned_params(request_body, general_settings, llm_router, model)
     for nested_key in _NESTED_CONFIG_KEYS:
         nested = _coerce_metadata_to_dict(request_body.get(nested_key))
@@ -361,6 +441,38 @@ def is_request_body_safe(
         metadata = _coerce_metadata_to_dict(request_body.get(metadata_key))
         if metadata is not None:
             _check_banned_params(metadata, general_settings, llm_router, model)
+        if any(
+            isinstance(key, str) and key.startswith(f"{metadata_key}[")
+            for key in request_body
+        ):
+            _check_banned_params(
+                extract_nested_form_metadata(
+                    form_data=request_body, prefix=f"{metadata_key}["
+                ),
+                general_settings,
+                llm_router,
+                model,
+            )
+    for target in iter_request_fallback_targets(request_body):
+        if isinstance(target, dict):
+            _check_banned_params(target, general_settings, llm_router, model)
+            target_model = target.get("model")
+            if isinstance(target_model, str):
+                _reject_url_valued_fallback_target(target_model)
+        elif isinstance(target, str):
+            _reject_url_valued_fallback_target(target)
+    litellm_params = _coerce_metadata_to_dict(request_body.get("litellm_params"))
+    if litellm_params is not None:
+        litellm_params_metadata = _coerce_metadata_to_dict(
+            litellm_params.get("metadata")
+        )
+        if litellm_params_metadata is not None:
+            _check_banned_params(
+                litellm_params_metadata,
+                general_settings,
+                llm_router,
+                model,
+            )
     return True
 
 
@@ -497,9 +609,18 @@ def route_in_additonal_public_routes(current_route: str):
 
 def get_request_route(request: Request) -> str:
     """
-    Helper to get the route from the request
+    Resolve the request route from the ASGI scope, with ``root_path`` stripped.
 
-    remove base url from path if set e.g. `/genai/chat/completions` -> `/chat/completions
+    Prefer this over ``request.url.path`` for any auth, ACL, routing, or
+    audit-log decision: Starlette reconstructs ``url.path`` by interpolating
+    the Host header into a URL string and re-parsing with ``urlsplit``, so a
+    malformed Host (e.g. ``localhost/?x=1``) collapses ``url.path`` to ``"/"``
+    while FastAPI continues to dispatch on ``scope["path"]``. ``scope["path"]``
+    is uvicorn's parse of the HTTP request line and matches the actual
+    handler, so it's the authoritative route.
+
+    Also normalizes sub-path deployments by stripping ``scope["root_path"]``
+    e.g. ``/genai/chat/completions`` -> ``/chat/completions``.
     """
     try:
         scope = request.scope
@@ -520,6 +641,25 @@ def get_request_route(request: Request) -> str:
             f"error on get_request_route: {str(e)}, defaulting to request.url.path={request.url.path}"
         )
         return str(request.url.path)
+
+
+def get_request_route_template(request: Request) -> Optional[str]:
+    """
+    Return the low-cardinality route template, e.g.
+    ``/v1/threads/{thread_id}/runs`` (vs. the literal path from
+    ``get_request_route``). FastAPI sets ``scope["route"]`` before endpoint
+    dependencies run. Returns None if unavailable (unmatched path, Mount).
+    """
+    try:
+        scope = request.scope
+        if not isinstance(scope, dict):
+            return None
+        route = scope.get("route")
+        template = getattr(route, "path", None)
+        return template if isinstance(template, str) and template else None
+    except Exception as e:
+        verbose_proxy_logger.debug(f"error on get_request_route_template: {str(e)}")
+        return None
 
 
 @lru_cache(maxsize=256)
@@ -989,9 +1129,44 @@ def _get_customer_id_from_standard_headers(
     for standard_header in STANDARD_CUSTOMER_ID_HEADERS:
         for header_name, header_value in request_headers.items():
             if header_name.lower() == standard_header.lower():
-                user_id_str = str(header_value) if header_value is not None else ""
-                if user_id_str.strip():
+                user_id_str = _coerce_user_id_to_str(header_value)
+                if user_id_str:
                     return user_id_str
+    return None
+
+
+def _coerce_user_id_to_str(value: Any) -> Optional[str]:
+    """Return a usable end-user identifier string, or None if the value isn't one.
+
+    Always drops non-string structured values (dict/list/tuple/set) because
+    stringifying them produces garbage spend-log rows like
+    ``"{'device_id': ...}"``. Strings that *decode* to a structured payload
+    are only rejected when ``litellm.validate_end_user_id_in_db`` is enabled
+    — operators who currently pass JSON-encoded identifiers keep their
+    existing behavior until they opt in. See
+    auth_utils.py:get_end_user_id_from_request_body for the extraction chain.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        # bool is an int subclass; handle explicitly to avoid "True"/"False".
+        return None
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        # Reject strings that decode to a structured payload (JSON object/array)
+        # only when the operator has opted into end-user validation. Gating
+        # behind the flag preserves backwards compatibility for deployments
+        # that intentionally pass JSON-encoded user identifiers.
+        if litellm.validate_end_user_id_in_db and stripped[:1] in ("{", "["):
+            parsed = safe_json_loads(stripped)
+            if isinstance(parsed, (dict, list)):
+                return None
+        return stripped
+    # dict, list, tuple, set, arbitrary objects -> drop.
     return None
 
 
@@ -1033,23 +1208,22 @@ def get_end_user_id_from_request_body(
         if isinstance(custom_header_name_to_check, list):
             headers_lower = {k.lower(): v for k, v in request_headers.items()}
             for expected_header in custom_header_name_to_check:
-                header_value = headers_lower.get(expected_header)
-                if header_value is not None:
-                    user_id_str = str(header_value)
-                    if user_id_str.strip():
-                        return user_id_str
+                user_id_str = _coerce_user_id_to_str(headers_lower.get(expected_header))
+                if user_id_str:
+                    return user_id_str
 
         elif isinstance(custom_header_name_to_check, str):
             for header_name, header_value in request_headers.items():
                 if header_name.lower() == custom_header_name_to_check.lower():
-                    user_id_str = str(header_value) if header_value is not None else ""
-                    if user_id_str.strip():
+                    user_id_str = _coerce_user_id_to_str(header_value)
+                    if user_id_str:
                         return user_id_str
 
     # Check 3: 'user' field in request_body (commonly OpenAI)
-    if "user" in request_body and request_body["user"] is not None:
-        user_from_body_user_field = request_body["user"]
-        return str(user_from_body_user_field)
+    if "user" in request_body:
+        user_id_str = _coerce_user_id_to_str(request_body["user"])
+        if user_id_str:
+            return user_id_str
 
     def _as_dict(value: Any) -> dict:
         # metadata / litellm_metadata can arrive as JSON strings from
@@ -1058,32 +1232,30 @@ def get_end_user_id_from_request_body(
         if isinstance(value, dict):
             return value
         if isinstance(value, str):
-            from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
-
             parsed = safe_json_loads(value)
             return parsed if isinstance(parsed, dict) else {}
         return {}
 
     # Check 4: 'litellm_metadata.user' in request_body (commonly Anthropic)
     litellm_metadata = _as_dict(request_body.get("litellm_metadata"))
-    user_from_litellm_metadata = litellm_metadata.get("user")
-    if user_from_litellm_metadata is not None:
-        return str(user_from_litellm_metadata)
+    user_id_str = _coerce_user_id_to_str(litellm_metadata.get("user"))
+    if user_id_str:
+        return user_id_str
 
     # Check 5: 'metadata.user_id' in request_body (another common pattern)
     metadata_dict = _as_dict(request_body.get("metadata"))
-    user_id_from_metadata_field = metadata_dict.get("user_id")
-    if user_id_from_metadata_field is not None:
-        return str(user_id_from_metadata_field)
+    user_id_str = _coerce_user_id_to_str(metadata_dict.get("user_id"))
+    if user_id_str:
+        return user_id_str
 
     # Check 6: 'safety_identifier' in request body (OpenAI Responses API parameter)
     # SECURITY NOTE: safety_identifier can be set by any caller in the request body.
     # Only use this for end-user identification in trusted environments where you control
     # the calling application. For untrusted callers, prefer using headers or server-side
     # middleware to set the end_user_id to prevent impersonation.
-    if request_body.get("safety_identifier") is not None:
-        user_from_body_user_field = request_body["safety_identifier"]
-        return str(user_from_body_user_field)
+    user_id_str = _coerce_user_id_to_str(request_body.get("safety_identifier"))
+    if user_id_str:
+        return user_id_str
 
     return None
 
@@ -1177,7 +1349,9 @@ def _route_uses_model_routing_sources(route: str) -> bool:
 
 
 def _extract_models_from_managed_resource_id(
-    resource_id: Any, resource_id_field: Optional[str] = None
+    resource_id: Any,
+    resource_id_field: Optional[str] = None,
+    llm_router: Optional[Router] = None,
 ) -> List[str]:
     if not isinstance(resource_id, str) or not resource_id:
         return []
@@ -1234,16 +1408,18 @@ def _extract_models_from_managed_resource_id(
             )
 
             if resource_id_field == "video_id":
+                model_id = decode_video_id_with_provider(resource_id).get("model_id")
                 _append_model_candidates(
                     candidates=candidates,
-                    value=decode_video_id_with_provider(resource_id).get("model_id"),
+                    value=_resolve_model_id_with_router(model_id, llm_router),
                 )
             else:
+                model_id = decode_character_id_with_provider(resource_id).get(
+                    "model_id"
+                )
                 _append_model_candidates(
                     candidates=candidates,
-                    value=decode_character_id_with_provider(resource_id).get(
-                        "model_id"
-                    ),
+                    value=_resolve_model_id_with_router(model_id, llm_router),
                 )
         except Exception as e:
             verbose_proxy_logger.debug(
@@ -1253,11 +1429,26 @@ def _extract_models_from_managed_resource_id(
     return _dedupe_model_candidates(candidates)
 
 
+def _resolve_model_id_with_router(
+    model_id: Optional[str], llm_router: Optional[Router]
+) -> Optional[str]:
+    if model_id is None or llm_router is None:
+        return model_id
+    try:
+        return llm_router.resolve_model_name_from_model_id(model_id) or model_id
+    except Exception as e:
+        verbose_proxy_logger.debug(
+            "Unable to resolve model_id from managed resource ID: %s", str(e)
+        )
+        return model_id
+
+
 def _extract_model_candidates_from_request(
     request_data: dict,
     route: str,
     request_headers: Optional[Mapping[str, Any]] = None,
     request_query_params: Optional[Mapping[str, Any]] = None,
+    llm_router: Optional[Router] = None,
 ) -> List[str]:
     candidates: List[str] = []
     uses_model_routing_sources = _route_uses_model_routing_sources(route=route)
@@ -1307,7 +1498,9 @@ def _extract_model_candidates_from_request(
             _append_model_candidates(
                 candidates,
                 _extract_models_from_managed_resource_id(
-                    request_data.get(field), resource_id_field=field
+                    request_data.get(field),
+                    resource_id_field=field,
+                    llm_router=llm_router,
                 ),
             )
 
@@ -1329,12 +1522,14 @@ def get_model_from_request(
     route: str,
     request_headers: Optional[Mapping[str, Any]] = None,
     request_query_params: Optional[Mapping[str, Any]] = None,
+    llm_router: Optional[Router] = None,
 ) -> Optional[Union[str, List[str]]]:
     candidates = _extract_model_candidates_from_request(
         request_data=request_data,
         route=route,
         request_headers=request_headers,
         request_query_params=request_query_params,
+        llm_router=llm_router,
     )
     model = _format_model_candidates(candidates)
 

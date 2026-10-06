@@ -1,10 +1,10 @@
 # Maintained credential and HTTP stream lifecycle
 
-This is an explicit MIT-licensed fork of BerriAI/LiteLLM, based on `v1.84.0`
-(`e1fc955464bf493c15aef08f98e0e22bdf24d4cf`). The baseline's 1,797 shipped Python
-files match the PyPI 1.84.0 wheel. Version `1.84.0+agite.1` changes only
-`litellm/llms/chatgpt/authenticator.py` in the shipped package and declares
-`filelock` as a direct dependency. All upstream attribution remains.
+This is an explicit MIT-licensed fork of BerriAI/LiteLLM. Version
+`1.88.6+agite.1` is based on `v1.88.6`
+(`b504a0eeb6f8a26daae3a2ebca12ccc2cacd3a2f`) and retains the maintained headless
+ChatGPT credential and HTTP response-ownership fixes below. `filelock` remains
+a direct dependency. All upstream attribution remains.
 
 ## Operational contract
 
@@ -33,7 +33,7 @@ existing LiteLLM flat JSON format; no desktop-cache converter is included.
 Run `python -m pytest -q tests/test_litellm/llms/chatgpt`. These tests use
 disposable credentials, the real filesystem, subprocesses and HTTP transports;
 they do not patch production methods. Audit both the fork's complete dependency
-resolution and upstream `litellm==1.84.0`: PyPI advisory lookup does not recognize
+resolution and upstream `litellm==1.88.6`: PyPI advisory lookup does not recognize
 local fork versions or URL requirements. A skipped fork is not an audit pass.
 Rebase only after rerunning lifecycle and native Responses regression tests.
 
@@ -56,3 +56,14 @@ from agite.1 is limited to `base_model_iterator.py` and `llm_http_handler.py`.
 Run `tests/test_litellm/llms/custom_httpx/test_response_ownership.py` for closure
 before and after the first chunk; the runtime also tests actual loopback HTTP
 streams, cancellation, inactivity and observed versus synthetic status codes.
+
+## 1.88.6+agite.1: upstream security baseline
+
+Rebased the maintained credential and response-ownership changes onto upstream
+`v1.88.6` (`b504a0eeb6f8a26daae3a2ebca12ccc2cacd3a2f`). This includes the upstream
+fix for GHSA-3cv6-jpf6-8222 (PYSEC-2026-4066), covering unvalidated proxy routing
+and credential parameters. The prior 1.84 sections above record historical
+patch provenance; this release must be audited as upstream `litellm==1.88.6`.
+The upstream Python support bound is preserved: Python 3.10 through 3.13.
+
+Source: https://github.com/BerriAI/litellm/security/advisories/GHSA-3cv6-jpf6-8222

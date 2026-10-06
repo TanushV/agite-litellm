@@ -15,7 +15,7 @@ sys.path.insert(
 )  # Adds the parent directory to the system path
 
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from litellm.proxy.utils import get_custom_url, join_paths
 
@@ -69,6 +69,53 @@ def test_proxy_only_error_false_for_other_error_type():
         )
         is False
     )
+
+
+@pytest.mark.asyncio
+async def test_proxy_only_error_log_marks_no_upstream_llm_call():
+    """A proxy-gate error (auth/rate-limit) synthesizes a ``Logging`` object and
+    fires ``pre_call`` so the failure is logged — but it must tag the object with
+    ``LITELLM_LOGGING_NO_UPSTREAM_LLM_CALL`` so tracing callbacks don't fabricate
+    an LLM-call span for a request that never reached a provider (root cause of the
+    misplaced gen-AI span on auth failure)."""
+    from litellm.constants import LITELLM_LOGGING_NO_UPSTREAM_LLM_CALL
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    proxy_logging_obj = ProxyLogging(user_api_key_cache=DualCache())
+    captured = {}
+
+    def fake_pre_call(self, *args, **kwargs):
+        captured["flag"] = self.model_call_details.get(
+            LITELLM_LOGGING_NO_UPSTREAM_LLM_CALL
+        )
+
+    from litellm.litellm_core_utils.litellm_logging import Logging
+
+    orig_pre_call = Logging.pre_call
+    orig_async_failure = Logging.async_failure_handler
+    Logging.pre_call = fake_pre_call
+
+    async def _noop_async_failure(self, *args, **kwargs):
+        return None
+
+    Logging.async_failure_handler = _noop_async_failure
+    try:
+        await proxy_logging_obj._handle_logging_proxy_only_error(
+            request_data={
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            user_api_key_dict=UserAPIKeyAuth(
+                api_key="sk-bad", request_route="/v1/chat/completions"
+            ),
+            route="/v1/chat/completions",
+            original_exception=Exception("bad key"),
+        )
+    finally:
+        Logging.pre_call = orig_pre_call
+        Logging.async_failure_handler = orig_async_failure
+
+    assert captured.get("flag") is True
 
 
 def test_get_model_group_info_order():
@@ -264,3 +311,223 @@ def test_enrich_http_exception_callback_without_guardrail_name_noop():
     exc = HTTPException(status_code=400, detail={"error": "x"})
     _enrich_http_exception_with_guardrail_context(exc, StubCallback())
     assert exc.detail == {"error": "x"}
+
+
+class TestPostCallFailureHookLiftsFirstApiCallStartTime:
+    """post_call_failure_hook lifts first_api_call_start_time off the
+    logging object into request_data (an internal top-level key) before
+    the non-serialisable logging object is popped, so failure-path
+    callbacks (OTel preprocessing latency) can still read it. It must
+    never land in request_data["metadata"] (user request metadata,
+    echoed downstream and typed Dict[str, str] in batch objects).
+    """
+
+    async def _run(self, request_data):
+        from unittest.mock import AsyncMock, patch
+
+        from litellm.proxy._types import UserAPIKeyAuth
+
+        proxy_logging_obj = ProxyLogging(user_api_key_cache=DualCache())
+        proxy_logging_obj.alert_types = []  # skip alerting branch
+        with patch.object(proxy_logging_obj, "update_request_status", new=AsyncMock()):
+            await proxy_logging_obj.post_call_failure_hook(
+                request_data=request_data,
+                original_exception=Exception("boom"),
+                user_api_key_dict=UserAPIKeyAuth(),
+            )
+
+    @pytest.mark.asyncio
+    async def test_lifts_to_top_level_and_pops_logging_obj(self):
+        handoff = real_datetime.datetime(2026, 1, 1, 0, 0, 0)
+        logging_obj = MagicMock()
+        logging_obj.model_call_details = {"first_api_call_start_time": handoff}
+        user_meta = {}
+        request_data = {
+            "litellm_logging_obj": logging_obj,
+            "metadata": user_meta,
+        }
+        await self._run(request_data)
+
+        assert request_data["first_api_call_start_time"] == handoff
+        assert "litellm_logging_obj" not in request_data
+        # user metadata is never touched
+        assert user_meta == {}
+        assert "first_api_call_start_time" not in request_data["metadata"]
+
+    @pytest.mark.asyncio
+    async def test_no_logging_obj_is_noop(self):
+        request_data = {"metadata": {}}
+        await self._run(request_data)
+        assert "first_api_call_start_time" not in request_data
+
+    @pytest.mark.asyncio
+    async def test_logging_obj_without_anchor_is_noop(self):
+        logging_obj = MagicMock()
+        logging_obj.model_call_details = {}
+        request_data = {"litellm_logging_obj": logging_obj}
+        await self._run(request_data)
+        assert "first_api_call_start_time" not in request_data
+        assert "litellm_logging_obj" not in request_data
+
+
+class TestPostCallFailureHookLLMExceptionAlerting:
+    """The llm_exceptions alert is for infra / LLM-API failures, not user
+    errors (https://github.com/BerriAI/litellm/issues/3395). Already-normalized
+    client errors must be excluded so a guardrail content-policy block never
+    pages on-call. ProxyException is such an error; before LIT-3751 only
+    HTTPException was excluded, so AIM blocks paged as if the LLM API failed."""
+
+    async def _alerted(self, exc) -> bool:
+        import asyncio
+        from unittest.mock import AsyncMock
+
+        from litellm.proxy._types import AlertType, UserAPIKeyAuth
+
+        proxy_logging_obj = ProxyLogging(user_api_key_cache=DualCache())
+        proxy_logging_obj.alert_types = [AlertType.llm_exceptions]
+        alerting_handler = AsyncMock()
+        with (
+            patch.object(proxy_logging_obj, "update_request_status", new=AsyncMock()),
+            patch.object(proxy_logging_obj, "alerting_handler", new=alerting_handler),
+        ):
+            await proxy_logging_obj.post_call_failure_hook(
+                request_data={},
+                original_exception=exc,
+                user_api_key_dict=UserAPIKeyAuth(),
+            )
+        await asyncio.sleep(0)  # let the fire-and-forget alert task run
+        return alerting_handler.called
+
+    @pytest.mark.asyncio
+    async def test_proxy_exception_does_not_alert(self):
+        from litellm.proxy._types import ProxyException
+
+        exc = ProxyException(
+            message="content blocked",
+            type="invalid_request_error",
+            param=None,
+            code=400,
+            openai_code="content_policy_violation",
+        )
+        assert await self._alerted(exc) is False
+
+    @pytest.mark.asyncio
+    async def test_http_exception_does_not_alert(self):
+        assert (
+            await self._alerted(HTTPException(status_code=400, detail="blocked"))
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_genuine_llm_api_error_still_alerts(self):
+        assert await self._alerted(Exception("upstream 503")) is True
+
+
+class TestPostCallFailureHookProxyExceptionLogging:
+    """A guardrail block raises a ProxyException; on an LLM route it must still
+    drive proxy-only failure logging (_handle_logging_proxy_only_error) so the
+    blocked request is recorded, exactly as the old HTTPException did. Before
+    LIT-3751 the classifier only matched HTTPException, so switching AIM to
+    ProxyException silently dropped the rejected prompt from failure logs."""
+
+    async def _logged(self, exc, *, request_route) -> bool:
+        from unittest.mock import AsyncMock
+
+        from litellm.proxy._types import UserAPIKeyAuth
+
+        proxy_logging_obj = ProxyLogging(user_api_key_cache=DualCache())
+        proxy_logging_obj.alert_types = []
+        handle_mock = AsyncMock()
+        with (
+            patch.object(proxy_logging_obj, "update_request_status", new=AsyncMock()),
+            patch.object(
+                proxy_logging_obj,
+                "_handle_logging_proxy_only_error",
+                new=handle_mock,
+            ),
+        ):
+            await proxy_logging_obj.post_call_failure_hook(
+                request_data={},
+                original_exception=exc,
+                user_api_key_dict=UserAPIKeyAuth(
+                    api_key="sk-test", request_route=request_route
+                ),
+            )
+        return handle_mock.await_count > 0
+
+    def _block(self):
+        from litellm.proxy._types import ProxyException
+
+        return ProxyException(
+            message="content blocked",
+            type="invalid_request_error",
+            param=None,
+            code=400,
+            openai_code="content_policy_violation",
+        )
+
+    @pytest.mark.asyncio
+    async def test_proxy_exception_on_llm_route_is_logged(self):
+        assert (
+            await self._logged(self._block(), request_route="/v1/chat/completions")
+            is True
+        )
+
+    @pytest.mark.asyncio
+    async def test_generic_exception_on_llm_route_is_not_logged(self):
+        # A raw provider/unknown exception is logged by the LLM call path, not here.
+        assert (
+            await self._logged(
+                Exception("upstream 503"), request_route="/v1/chat/completions"
+            )
+            is False
+        )
+
+
+class TestPostCallFailureHookLiftsRecoveredPartialSpend:
+    """A stream that broke mid-flight still billed the provider for the chunks
+    already delivered. The streaming handler stashes that recovered usage and
+    cost on the logging object; post_call_failure_hook must lift them onto
+    request_data before the logging object is popped, so the failure-path spend
+    callbacks (which run after the pop) record the real partial spend.
+    """
+
+    async def _run(self, request_data):
+        from unittest.mock import AsyncMock, patch
+
+        from litellm.proxy._types import UserAPIKeyAuth
+
+        proxy_logging_obj = ProxyLogging(user_api_key_cache=DualCache())
+        proxy_logging_obj.alert_types = []
+        with patch.object(proxy_logging_obj, "update_request_status", new=AsyncMock()):
+            await proxy_logging_obj.post_call_failure_hook(
+                request_data=request_data,
+                original_exception=Exception("boom"),
+                user_api_key_dict=UserAPIKeyAuth(),
+            )
+
+    @pytest.mark.asyncio
+    async def test_lifts_recovered_usage_and_cost(self):
+        from litellm.types.utils import Usage
+
+        recovered_usage = Usage(prompt_tokens=30, completion_tokens=1, total_tokens=31)
+        logging_obj = MagicMock()
+        logging_obj.model_call_details = {
+            "combined_usage_object": recovered_usage,
+            "response_cost": 3.5e-05,
+        }
+        request_data = {"litellm_logging_obj": logging_obj, "metadata": {}}
+        await self._run(request_data)
+
+        assert request_data["combined_usage_object"] is recovered_usage
+        assert request_data["response_cost"] == 3.5e-05
+        assert "litellm_logging_obj" not in request_data
+
+    @pytest.mark.asyncio
+    async def test_no_recovered_usage_is_noop(self):
+        logging_obj = MagicMock()
+        logging_obj.model_call_details = {}
+        request_data = {"litellm_logging_obj": logging_obj, "metadata": {}}
+        await self._run(request_data)
+        assert "combined_usage_object" not in request_data
+        assert "response_cost" not in request_data

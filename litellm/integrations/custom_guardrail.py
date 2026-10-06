@@ -1,3 +1,4 @@
+import secrets
 from datetime import datetime
 from typing import (
     TYPE_CHECKING,
@@ -43,7 +44,18 @@ if TYPE_CHECKING:
 dc = DualCache()
 
 
-from litellm.exceptions import ModifyResponseException as ModifyResponseException
+from litellm.constants import PRE_CALL_EXECUTED_GUARDRAILS_KEY
+from litellm.exceptions import (
+    BlockedPiiEntityError,
+    GuardrailRaisedException,
+    ModifyResponseException,
+)
+
+# Per-process secret tagging each recorded marker. The deployment hook only
+# honors markers carrying this token, so a caller cannot forge the metadata
+# field to suppress a guardrail on the direct-SDK path that never reaches the
+# proxy's metadata sanitizer.
+_PRE_CALL_EXECUTED_TOKEN = secrets.token_hex(16)
 
 
 class CustomGuardrail(CustomLogger):
@@ -321,6 +333,49 @@ class CustomGuardrail(CustomLogger):
 
         return False
 
+    def _pre_call_marker(self) -> Optional[str]:
+        name = self.guardrail_name
+        if not name:
+            return None
+        return f"{_PRE_CALL_EXECUTED_TOKEN}:{name}"
+
+    def mark_pre_call_hook_ran(self, data: Dict[str, Any]) -> None:
+        """
+        Record that this guardrail's ``async_pre_call_hook`` already ran for this
+        request, so the deployment-level hook does not run it a second time.
+
+        The proxy runs pre-call guardrails in ``ProxyLogging.pre_call_hook``. The
+        router later spreads a deployment's model-level ``guardrails`` into the
+        top-level request kwargs, which would otherwise re-trigger the same hook
+        from ``async_pre_call_deployment_hook``.
+        """
+        marker = self._pre_call_marker()
+        if marker is None:
+            return
+        for meta_key in ("metadata", "litellm_metadata"):
+            meta = data.get(meta_key)
+            if isinstance(meta, dict):
+                executed = meta.get(PRE_CALL_EXECUTED_GUARDRAILS_KEY)
+                if isinstance(executed, list):
+                    if marker not in executed:
+                        executed.append(marker)
+                else:
+                    meta[PRE_CALL_EXECUTED_GUARDRAILS_KEY] = [marker]
+                return
+        data["metadata"] = {PRE_CALL_EXECUTED_GUARDRAILS_KEY: [marker]}
+
+    def _pre_call_hook_already_ran(self, data: Dict[str, Any]) -> bool:
+        marker = self._pre_call_marker()
+        if marker is None:
+            return False
+        for meta_key in ("metadata", "litellm_metadata"):
+            meta = data.get(meta_key)
+            if isinstance(meta, dict):
+                executed = meta.get(PRE_CALL_EXECUTED_GUARDRAILS_KEY)
+                if isinstance(executed, list) and marker in executed:
+                    return True
+        return False
+
     async def async_pre_call_deployment_hook(
         self, kwargs: Dict[str, Any], call_type: Optional[CallTypes]
     ) -> Optional[dict]:
@@ -329,6 +384,9 @@ class CustomGuardrail(CustomLogger):
         # should run guardrail
         litellm_guardrails = kwargs.get("guardrails")
         if litellm_guardrails is None or not isinstance(litellm_guardrails, list):
+            return kwargs
+
+        if self._pre_call_hook_already_ran(kwargs):
             return kwargs
 
         if (
@@ -737,11 +795,14 @@ class CustomGuardrail(CustomLogger):
         (this was logged previously as an API failure - guardrail_failed_to_respond).
 
         Guardrails signal intentional blocks by raising:
+        - GuardrailRaisedException (generic guardrail API, tool permission)
+        - BlockedPiiEntityError (Presidio PII detection)
         - HTTPException with status 400 (content policy violation)
         - ModifyResponseException (passthrough mode violation)
         """
-
         if isinstance(e, ModifyResponseException):
+            return True
+        if isinstance(e, (GuardrailRaisedException, BlockedPiiEntityError)):
             return True
         if (
             HTTPException is not None
@@ -888,6 +949,15 @@ def log_guardrail_information(func):
         - pre_call
         - during_call
         - post_call
+
+    Some guardrails (e.g. ``block_code_execution``) call
+    ``add_standard_logging_guardrail_information_to_request_data`` directly
+    from inside the wrapped function so they can record a richer payload
+    (structured detections, tracing detail) than this decorator's
+    "allow"/"mask"/raw-response default. To avoid double-recording in that
+    case (which would emit two spans, two Datadog records, two spend-log
+    entries, etc.), snapshot the entry count before invocation: if the
+    wrapped function already appended its own entry, skip the auto-record.
     """
     import functools
     import inspect
@@ -907,6 +977,16 @@ def log_guardrail_information(func):
             return GuardrailEventHooks.post_call
         return None
 
+    def _count_recorded_guardrail_entries(request_data: dict) -> int:
+        total = 0
+        for container_key in ("metadata", "litellm_metadata"):
+            container = request_data.get(container_key)
+            if isinstance(container, dict):
+                entries = container.get("standard_logging_guardrail_information")
+                if isinstance(entries, list):
+                    total += len(entries)
+        return total
+
     @functools.wraps(func)
     async def async_wrapper(*args, **kwargs):
         start_time = datetime.now()  # Move start_time inside the wrapper
@@ -919,8 +999,11 @@ def log_guardrail_information(func):
         if func.__name__ == "apply_guardrail" and "inputs" in kwargs:
             original_inputs = kwargs.get("inputs")
 
+        entries_before = _count_recorded_guardrail_entries(request_data)
         try:
             response = await func(*args, **kwargs)
+            if _count_recorded_guardrail_entries(request_data) > entries_before:
+                return response
             return self._process_response(
                 response=response,
                 request_data=request_data,
@@ -931,6 +1014,8 @@ def log_guardrail_information(func):
                 original_inputs=original_inputs,
             )
         except Exception as e:
+            if _count_recorded_guardrail_entries(request_data) > entries_before:
+                raise
             return self._process_error(
                 e=e,
                 request_data=request_data,
@@ -952,8 +1037,11 @@ def log_guardrail_information(func):
         if func.__name__ == "apply_guardrail" and "inputs" in kwargs:
             original_inputs = kwargs.get("inputs")
 
+        entries_before = _count_recorded_guardrail_entries(request_data)
         try:
             response = func(*args, **kwargs)
+            if _count_recorded_guardrail_entries(request_data) > entries_before:
+                return response
             return self._process_response(
                 response=response,
                 request_data=request_data,
@@ -962,6 +1050,8 @@ def log_guardrail_information(func):
                 original_inputs=original_inputs,
             )
         except Exception as e:
+            if _count_recorded_guardrail_entries(request_data) > entries_before:
+                raise
             return self._process_error(
                 e=e,
                 request_data=request_data,

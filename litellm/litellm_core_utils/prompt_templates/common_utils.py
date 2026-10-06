@@ -3,6 +3,7 @@ Common utility functions used for translating messages across providers
 """
 
 import io
+import json
 import mimetypes
 import re
 from os import PathLike
@@ -20,6 +21,7 @@ from typing import (
     cast,
 )
 
+import litellm
 from litellm import verbose_logger
 from litellm.router_utils.batch_utils import InMemoryFile
 from litellm.types.llms.openai import (
@@ -131,6 +133,39 @@ def strip_none_values_from_message(message: AllMessageValues) -> AllMessageValue
     return cast(AllMessageValues, {k: v for k, v in message.items() if v is not None})
 
 
+def extract_search_results_text(search_results: object) -> str:
+    """
+    Extract model-visible text from OpenAI tool-message ``search_results``.
+
+    Used by token estimators and TPM limiters so large search result payloads
+    cannot bypass preflight checks via a small ``content`` field.
+
+    Counts every string field forwarded on Bedrock ``SearchResultBlock``:
+    ``source``, ``title``, ``content[].text``, and ``citations``.
+    """
+    if not isinstance(search_results, list):
+        return ""
+    texts = ""
+    for result in search_results:
+        if not isinstance(result, dict):
+            continue
+        for key in ("source", "title"):
+            value = result.get(key)
+            if isinstance(value, str):
+                texts += value
+        content = result.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        texts += text
+        citations = result.get("citations")
+        if citations is not None:
+            texts += json.dumps(citations, separators=(",", ":"))
+    return texts
+
+
 def convert_content_list_to_str(
     message: Union[AllMessageValues, ChatCompletionResponseMessage],
 ) -> str:
@@ -151,6 +186,7 @@ def convert_content_list_to_str(
         elif message_content is not None and isinstance(message_content, str):
             texts = message_content
 
+    texts += extract_search_results_text(message.get("search_results"))
     return texts
 
 
@@ -436,12 +472,21 @@ def update_messages_with_model_file_ids(
     """
     Updates messages with model file ids.
 
+    For managed files (unified file IDs), uses model_file_id_mapping if it
+    resolves the id, otherwise decodes the base64-encoded unified file ID
+    and extracts the llm_output_file_id directly. Mirrors the Responses-API
+    sibling `update_responses_input_with_model_file_ids`.
+
     model_file_id_mapping: Dict[str, Dict[str, str]] = {
         "litellm_proxy/file_id": {
             "model_id": "provider_file_id"
         }
     }
     """
+    from litellm.proxy.openai_files_endpoints.common_utils import (
+        _is_base64_encoded_unified_file_id,
+        convert_b64_uid_to_unified_uid,
+    )
 
     for message in messages:
         if message.get("role") == "user":
@@ -450,7 +495,13 @@ def update_messages_with_model_file_ids(
                 if isinstance(content, str):
                     continue
                 for c in content:
-                    if c["type"] == "file":
+                    if not isinstance(c, dict):
+                        # Content list items aren't always dicts. e.g.
+                        # text_completion forwards a token-ids list/list-of-
+                        # lists through this path. Skip non-dict items
+                        # instead of indexing into them.
+                        continue
+                    if c.get("type") == "file":
                         file_object = cast(ChatCompletionFileObject, c)
                         file_object_file_field = file_object.get("file")
                         if not isinstance(file_object_file_field, dict):
@@ -468,9 +519,23 @@ def update_messages_with_model_file_ids(
                         if file_id:
                             provider_file_id = (
                                 model_file_id_mapping.get(file_id, {}).get(model_id)
-                                or file_id
+                                if model_file_id_mapping
+                                else None
                             )
-                            file_object_file_field["file_id"] = provider_file_id
+                            if (
+                                not provider_file_id
+                                and _is_base64_encoded_unified_file_id(file_id)
+                            ):
+                                unified_file_id = convert_b64_uid_to_unified_uid(
+                                    file_id
+                                )
+                                if "llm_output_file_id," in unified_file_id:
+                                    provider_file_id = unified_file_id.split(
+                                        "llm_output_file_id,"
+                                    )[1].split(";")[0]
+                            file_object_file_field["file_id"] = (
+                                provider_file_id or file_id
+                            )
                         if format:
                             file_object_file_field["format"] = format
     return messages
@@ -690,6 +755,46 @@ def update_responses_tools_with_model_file_ids(
         updated_tools.append(updated_tool)
 
     return updated_tools
+
+
+def extract_file_metadata(file_data: FileTypes) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Resolve (filename, content_type) without reading the file body.
+
+    Mirrors extract_file_data's metadata resolution but never calls .read(), so
+    it stays O(1) on large uploads. Use this when only metadata is needed (batch
+    detection, GCS object naming) and the body must remain a streamable Path/handle.
+    """
+    filename: Optional[str] = None
+    content_type: Optional[str] = None
+    file_content: Any = None
+
+    if isinstance(file_data, tuple):
+        if len(file_data) == 2:
+            filename, file_content = file_data
+        elif len(file_data) == 3:
+            filename, file_content, content_type = file_data
+        elif len(file_data) == 4:
+            filename, file_content, content_type, _ = file_data
+    elif isinstance(file_data, InMemoryFile):
+        filename = file_data.name
+        content_type = file_data.content_type
+    else:
+        file_content = file_data
+
+    if filename is None:
+        if isinstance(file_content, PathLike):
+            filename = Path(file_content).name
+        elif isinstance(file_content, io.IOBase):
+            name_attr = getattr(file_content, "name", None)
+            if isinstance(name_attr, str):
+                filename = Path(name_attr).name
+
+    if not content_type:
+        guessed = mimetypes.guess_type(filename)[0] if filename else None
+        content_type = guessed or "application/octet-stream"
+
+    return filename, content_type
 
 
 def extract_file_data(file_data: FileTypes) -> ExtractedFileData:
@@ -1141,9 +1246,16 @@ def migrate_file_to_image_url(
         ChatCompletionImageUrlObject,
     )
 
-    file_id = message["file"].get("file_id")
-    file_data = message["file"].get("file_data")
-    format = message["file"].get("format")
+    file_sub = message.get("file")
+    if file_sub is None:
+        raise litellm.BadRequestError(
+            message="Content block has type='file' but is missing the required 'file' field",
+            model=None,
+            llm_provider=None,
+        )
+    file_id = file_sub.get("file_id")
+    file_data = file_sub.get("file_data")
+    format = file_sub.get("format")
     if not file_id and not file_data:
         raise ValueError("file_id and file_data are both None")
     image_url_object = ChatCompletionImageObject(
@@ -1167,12 +1279,8 @@ def get_last_user_message(messages: List[AllMessageValues]) -> Optional[str]:
         {"role": "assistant", "content": "I'm good, thank you!"},
         {"role": "user", "content": "What is the weather in Tokyo?"},
     ]
-    get_user_prompt(messages) -> "What is the weather in Tokyo?"
+    get_last_user_message(messages) -> "What is the weather in Tokyo?"
     """
-    from litellm.litellm_core_utils.prompt_templates.common_utils import (
-        convert_content_list_to_str,
-    )
-
     if not messages:
         return None
 

@@ -1,12 +1,13 @@
+import asyncio
 import json
 import ssl
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from typing import (
     TYPE_CHECKING,
     Any,
     AsyncIterator,
     Coroutine,
     Dict,
+    Iterator,
     List,
     Literal,
     Optional,
@@ -14,6 +15,7 @@ from typing import (
     Union,
     cast,
 )
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import httpx  # type: ignore
 from openai.types.file_deleted import FileDeleted
@@ -895,6 +897,18 @@ class BaseLLMHTTPHandler:
             headers=headers,
         )
 
+        # Some providers (e.g. OCI) require request signing after the body is built.
+        # The default BaseConfig.sign_request returns (headers, None) — a no-op for
+        # providers that don't need signing.
+        headers, signed_body = provider_config.sign_request(
+            headers=headers,
+            optional_params=optional_params,
+            request_data=data,
+            api_base=api_base,
+            api_key=api_key,
+            model=model,
+        )
+
         ## LOGGING
         logging_obj.pre_call(
             input=input,
@@ -921,6 +935,7 @@ class BaseLLMHTTPHandler:
                 client=client,
                 optional_params=optional_params,
                 litellm_params=litellm_params,
+                signed_body=signed_body,
             )
 
         if client is None or not isinstance(client, HTTPHandler):
@@ -931,12 +946,20 @@ class BaseLLMHTTPHandler:
             sync_httpx_client = client
 
         try:
-            response = sync_httpx_client.post(
-                url=api_base,
-                headers=headers,
-                data=json.dumps(data),
-                timeout=timeout,
-            )
+            if signed_body is not None:
+                response = sync_httpx_client.post(
+                    url=api_base,
+                    headers=headers,
+                    data=signed_body,
+                    timeout=timeout,
+                )
+            else:
+                response = sync_httpx_client.post(
+                    url=api_base,
+                    headers=headers,
+                    data=json.dumps(data),
+                    timeout=timeout,
+                )
         except Exception as e:
             raise self._handle_error(
                 e=e,
@@ -969,6 +992,7 @@ class BaseLLMHTTPHandler:
         api_key: Optional[str] = None,
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         client: Optional[Union[HTTPHandler, AsyncHTTPHandler]] = None,
+        signed_body: Optional[bytes] = None,
     ) -> EmbeddingResponse:
         if client is None or not isinstance(client, AsyncHTTPHandler):
             async_httpx_client = get_async_httpx_client(
@@ -979,12 +1003,20 @@ class BaseLLMHTTPHandler:
             async_httpx_client = client
 
         try:
-            response = await async_httpx_client.post(
-                url=api_base,
-                headers=headers,
-                json=request_data,
-                timeout=timeout,
-            )
+            if signed_body is not None:
+                response = await async_httpx_client.post(
+                    url=api_base,
+                    headers=headers,
+                    data=signed_body,
+                    timeout=timeout,
+                )
+            else:
+                response = await async_httpx_client.post(
+                    url=api_base,
+                    headers=headers,
+                    json=request_data,
+                    timeout=timeout,
+                )
         except Exception as e:
             raise self._handle_error(e=e, provider_config=provider_config)
 
@@ -1182,6 +1214,8 @@ class BaseLLMHTTPHandler:
 
         data = transformed_result.data
         files = transformed_result.files
+        if transformed_result.content_type is not None:
+            headers["Content-Type"] = transformed_result.content_type
 
         ## LOGGING
         logging_obj.pre_call(
@@ -1414,6 +1448,8 @@ class BaseLLMHTTPHandler:
             document=document,
             optional_params=optional_params,
             headers=headers,
+            api_key=api_key,
+            api_base=api_base,
         )
 
         # All providers return OCRRequestData
@@ -1482,6 +1518,8 @@ class BaseLLMHTTPHandler:
             document=document,
             optional_params=optional_params,
             headers=headers,
+            api_key=api_key,
+            api_base=api_base,
         )
 
         # All providers return OCRRequestData
@@ -1857,7 +1895,9 @@ class BaseLLMHTTPHandler:
         async_httpx_client: AsyncHTTPHandler,
         request_url: str,
         headers: dict,
-        signed_json_body: Optional[bytes],
+        # str when the caller passes a pre-serialized (unsigned) body to avoid
+        # re-dumping; bytes when a provider signed the request (e.g. Bedrock).
+        signed_json_body: Optional[Union[str, bytes]],
         request_body: dict,
         stream: bool,
         logging_obj: LiteLLMLoggingObj,
@@ -2048,8 +2088,18 @@ class BaseLLMHTTPHandler:
             model=model,
         )
 
+        # The request body was serialized once for the pre-call log input and
+        # again for the wire (json.dumps is O(payload), large for long-context
+        # Claude Code history). Serialize once and reuse for both. Only when
+        # the provider didn't sign the request (sign_request no-op for the
+        # native anthropic path -> signed_json_body is None); signed providers
+        # (e.g. Bedrock) keep their signed body untouched. The HTTP-error
+        # retry path mutates + re-signs the body, so it still re-serializes
+        # internally -- this only deduplicates the success path.
+        request_body_json = json.dumps(request_body)
+
         logging_obj.pre_call(
-            input=[{"role": "user", "content": json.dumps(request_body)}],
+            input=[{"role": "user", "content": request_body_json}],
             api_key="",
             additional_args={
                 "complete_input_dict": request_body,
@@ -2062,7 +2112,9 @@ class BaseLLMHTTPHandler:
             async_httpx_client=async_httpx_client,
             request_url=request_url,
             headers=headers,
-            signed_json_body=signed_json_body,
+            signed_json_body=(
+                signed_json_body if signed_json_body is not None else request_body_json
+            ),
             request_body=request_body,
             stream=stream or False,
             logging_obj=logging_obj,
@@ -2083,6 +2135,14 @@ class BaseLLMHTTPHandler:
                 request_body=request_body,
                 litellm_logging_obj=logging_obj,
             )
+
+            if not self._has_agentic_completion_hook(logging_obj):
+                # No callback overrides async_should_run_agentic_loop, so the
+                # agentic wrapper's only effect would be buffering every chunk
+                # and rebuilding the response from SSE at end-of-stream to call
+                # hooks that all return (False, {}). Stream through directly and
+                # skip that per-chunk + end-of-stream overhead.
+                return completion_stream
 
             from litellm.llms.anthropic.experimental_pass_through.messages.agentic_streaming_iterator import (
                 AgenticAnthropicStreamingIterator,
@@ -2262,6 +2322,31 @@ class BaseLLMHTTPHandler:
         # but never included in the outbound provider payload.
         request_context["litellm_params"] = dict(litellm_params)
 
+        is_stream_request = bool(stream)
+        if is_stream_request and fake_stream is True:
+            stream, data = self._prepare_fake_stream_request(
+                stream=stream,
+                data=data,
+                fake_stream=fake_stream,
+            )
+
+        # Sign after the body is final (post-transform/normalize/extra_body and post
+        # fake-stream prep) so signed bytes match what we send. No-op for providers
+        # that inherit the default sign_request.
+        headers, signed_body = responses_api_provider_config.sign_request(
+            headers=headers,
+            optional_params=dict(litellm_params),
+            request_data=data,
+            api_base=api_base,
+            api_key=litellm_params.api_key,
+            model=model,
+            stream=stream,
+            fake_stream=fake_stream,
+        )
+        body_kwargs: Dict[str, Any] = (
+            {"data": signed_body} if signed_body is not None else {"json": data}
+        )
+
         ## LOGGING
         logging_obj.pre_call(
             input=input,
@@ -2274,22 +2359,14 @@ class BaseLLMHTTPHandler:
         )
 
         try:
-            if stream:
-                # For streaming, use stream=True in the request
-                if fake_stream is True:
-                    stream, data = self._prepare_fake_stream_request(
-                        stream=stream,
-                        data=data,
-                        fake_stream=fake_stream,
-                    )
-
+            if is_stream_request:
                 response = sync_httpx_client.post(
                     url=api_base,
                     headers=headers,
-                    json=data,
                     timeout=timeout
                     or float(response_api_optional_request_params.get("timeout", 0)),
                     stream=stream,
+                    **body_kwargs,
                 )
                 if fake_stream is True:
                     return MockResponsesAPIStreamingIterator(
@@ -2314,13 +2391,12 @@ class BaseLLMHTTPHandler:
                     call_type=CallTypes.responses.value,
                 )
             else:
-                # For non-streaming requests
                 response = sync_httpx_client.post(
                     url=api_base,
                     headers=headers,
-                    json=data,
                     timeout=timeout
                     or float(response_api_optional_request_params.get("timeout", 0)),
+                    **body_kwargs,
                 )
         except Exception as e:
             raise self._handle_error(
@@ -2408,6 +2484,28 @@ class BaseLLMHTTPHandler:
         # but never included in the outbound provider payload.
         request_context["litellm_params"] = dict(litellm_params)
 
+        is_stream_request = bool(stream)
+        if is_stream_request and fake_stream is True:
+            stream, data = self._prepare_fake_stream_request(
+                stream=stream,
+                data=data,
+                fake_stream=fake_stream,
+            )
+
+        headers, signed_body = responses_api_provider_config.sign_request(
+            headers=headers,
+            optional_params=dict(litellm_params),
+            request_data=data,
+            api_base=api_base,
+            api_key=litellm_params.api_key,
+            model=model,
+            stream=stream,
+            fake_stream=fake_stream,
+        )
+        body_kwargs: Dict[str, Any] = (
+            {"data": signed_body} if signed_body is not None else {"json": data}
+        )
+
         ## LOGGING
         logging_obj.pre_call(
             input=input,
@@ -2420,22 +2518,14 @@ class BaseLLMHTTPHandler:
         )
 
         try:
-            if stream:
-                # For streaming, we need to use stream=True in the request
-                if fake_stream is True:
-                    stream, data = self._prepare_fake_stream_request(
-                        stream=stream,
-                        data=data,
-                        fake_stream=fake_stream,
-                    )
-
+            if is_stream_request:
                 response = await async_httpx_client.post(
                     url=api_base,
                     headers=headers,
-                    json=data,
                     timeout=timeout
                     or float(response_api_optional_request_params.get("timeout", 0)),
                     stream=stream,
+                    **body_kwargs,
                 )
 
                 if fake_stream is True:
@@ -2462,13 +2552,12 @@ class BaseLLMHTTPHandler:
                     call_type=CallTypes.responses.value,
                 )
             else:
-                # For non-streaming, proceed as before
                 response = await async_httpx_client.post(
                     url=api_base,
                     headers=headers,
-                    json=data,
                     timeout=timeout
                     or float(response_api_optional_request_params.get("timeout", 0)),
+                    **body_kwargs,
                 )
 
         except Exception as e:
@@ -3141,6 +3230,23 @@ class BaseLLMHTTPHandler:
                 data=presigned_request["data"],
                 timeout=timeout,
             )
+        elif (
+            isinstance(transformed_request, dict)
+            and "resumable_chunked_upload" in transformed_request
+        ):
+            try:
+                upload_response = self._resumable_chunked_upload(
+                    client=sync_httpx_client,
+                    initiate_url=api_base,
+                    base_headers=headers,
+                    config=cast(Dict[str, Any], transformed_request)[
+                        "resumable_chunked_upload"
+                    ],
+                    timeout=timeout,
+                )
+            except Exception as e:
+                verbose_logger.exception(f"Error creating file: {e}")
+                raise self._handle_error(e=e, provider_config=provider_config)
         elif isinstance(transformed_request, str) or isinstance(
             transformed_request, bytes
         ):
@@ -3222,7 +3328,15 @@ class BaseLLMHTTPHandler:
             input="",
             api_key="",
             additional_args={
-                "complete_input_dict": transformed_request,
+                # A resumable upload config holds a reference to the (potentially
+                # huge) upload payload; logging deep-copies additional_args, so log
+                # a placeholder instead of re-materializing the payload.
+                "complete_input_dict": (
+                    "<resumable chunked upload>"
+                    if isinstance(transformed_request, dict)
+                    and "resumable_chunked_upload" in transformed_request
+                    else transformed_request
+                ),
                 "api_base": api_base,
                 "headers": headers,
             },
@@ -3299,6 +3413,23 @@ class BaseLLMHTTPHandler:
                 data=presigned_request["data"],
                 timeout=timeout,
             )
+        elif (
+            isinstance(transformed_request, dict)
+            and "resumable_chunked_upload" in transformed_request
+        ):
+            try:
+                upload_response = await self._aresumable_chunked_upload(
+                    client=async_httpx_client,
+                    initiate_url=api_base,
+                    base_headers=headers,
+                    config=cast(Dict[str, Any], transformed_request)[
+                        "resumable_chunked_upload"
+                    ],
+                    timeout=timeout,
+                )
+            except Exception as e:
+                verbose_logger.exception(f"Error creating file: {e}")
+                raise self._handle_error(e=e, provider_config=provider_config)
         elif isinstance(transformed_request, str) or isinstance(
             transformed_request, bytes
         ):
@@ -3341,6 +3472,224 @@ class BaseLLMHTTPHandler:
             logging_obj=logging_obj,
             litellm_params=litellm_params,
         )
+
+    # 8 MiB; a 256 KiB multiple, which GCS requires for every non-final chunk.
+    _RESUMABLE_CHUNK_SIZE = 8 * 1024 * 1024
+
+    @staticmethod
+    def _iter_resumable_chunks(
+        byte_iter: Iterator[bytes], chunk_size: int
+    ) -> Iterator[bytes]:
+        """Regroup a byte stream into ``chunk_size`` pieces, yielding a final
+        partial piece only when it is non-empty. Every full piece is exactly
+        ``chunk_size`` bytes (kept a 256 KiB multiple for GCS) and never more than
+        one chunk is buffered. An exactly chunk-aligned stream yields only full
+        chunks, so the upload finalizes on its last data chunk instead of making
+        an extra empty request; a 0-byte stream yields nothing and the caller
+        finalizes with a single empty request.
+        """
+        buf = bytearray()
+        for piece in byte_iter:
+            buf.extend(piece)
+            while len(buf) >= chunk_size:
+                yield bytes(buf[:chunk_size])
+                del buf[:chunk_size]
+        if buf:
+            yield bytes(buf)
+
+    @staticmethod
+    def _resumable_content_range(offset: int, data_len: int, is_final: bool) -> str:
+        if not is_final:
+            return f"bytes {offset}-{offset + data_len - 1}/*"
+        total = offset + data_len
+        if data_len == 0:
+            return f"bytes */{total}"
+        return f"bytes {offset}-{total - 1}/{total}"
+
+    @staticmethod
+    def _resumable_request_kwargs(
+        headers: dict,
+        content: bytes,
+        timeout: Optional[Union[float, httpx.Timeout]],
+    ) -> dict:
+        kwargs: Dict[str, Any] = {"headers": headers, "content": content}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        return kwargs
+
+    def _resumable_chunked_upload(
+        self,
+        *,
+        client: HTTPHandler,
+        initiate_url: str,
+        base_headers: dict,
+        config: dict,
+        timeout: Optional[Union[float, httpx.Timeout]],
+    ) -> httpx.Response:
+        """Open a GCS resumable session, then PUT the body in bounded chunks so a
+        large upload is never held in memory in full."""
+        stream = config["body_stream"]
+        chunk_size = config.get("chunk_size", self._RESUMABLE_CHUNK_SIZE)
+        session_url_header = config.get("session_url_header", "location")
+        httpx_client = client.client
+
+        init_headers = {**base_headers, **config.get("initiate_headers", {})}
+        init_req = httpx_client.build_request(
+            "POST",
+            initiate_url,
+            **self._resumable_request_kwargs(init_headers, b"", timeout),
+        )
+        init_resp = httpx_client.send(init_req, follow_redirects=False)
+        init_resp.read()
+        if init_resp.status_code not in (200, 201):
+            init_resp.raise_for_status()
+        session_url = init_resp.headers.get(session_url_header)
+        if not session_url:
+            raise ValueError(
+                f"resumable upload: no session URL in '{session_url_header}' header"
+            )
+
+        offset = 0
+        pending: Optional[bytes] = None
+        for chunk in self._iter_resumable_chunks(stream.iter_bytes(), chunk_size):
+            if pending is not None:
+                self._send_resumable_chunk(
+                    httpx_client,
+                    session_url,
+                    base_headers,
+                    pending,
+                    offset,
+                    is_final=False,
+                    timeout=timeout,
+                )
+                offset += len(pending)
+            pending = chunk
+        return self._send_resumable_chunk(
+            httpx_client,
+            session_url,
+            base_headers,
+            pending or b"",
+            offset,
+            is_final=True,
+            timeout=timeout,
+        )
+
+    def _send_resumable_chunk(
+        self,
+        httpx_client: httpx.Client,
+        url: str,
+        base_headers: dict,
+        data: bytes,
+        offset: int,
+        *,
+        is_final: bool,
+        timeout: Optional[Union[float, httpx.Timeout]],
+    ) -> httpx.Response:
+        headers = {
+            **base_headers,
+            "Content-Range": self._resumable_content_range(offset, len(data), is_final),
+        }
+        req = httpx_client.build_request(
+            "PUT", url, **self._resumable_request_kwargs(headers, data, timeout)
+        )
+        resp = httpx_client.send(req, follow_redirects=False)
+        resp.read()
+        if resp.status_code not in ((200, 201) if is_final else (308,)):
+            # 4xx/5xx raise here; the ValueError catches an unexpected success
+            # status (e.g. a 200 where the protocol expects a 308 between chunks).
+            resp.raise_for_status()
+            raise ValueError(f"resumable upload: unexpected status {resp.status_code}")
+        return resp
+
+    async def _aresumable_chunked_upload(
+        self,
+        *,
+        client: AsyncHTTPHandler,
+        initiate_url: str,
+        base_headers: dict,
+        config: dict,
+        timeout: Optional[Union[float, httpx.Timeout]],
+    ) -> httpx.Response:
+        stream = config["body_stream"]
+        chunk_size = config.get("chunk_size", self._RESUMABLE_CHUNK_SIZE)
+        session_url_header = config.get("session_url_header", "location")
+        httpx_client = client.client
+
+        init_headers = {**base_headers, **config.get("initiate_headers", {})}
+        init_req = httpx_client.build_request(
+            "POST",
+            initiate_url,
+            **self._resumable_request_kwargs(init_headers, b"", timeout),
+        )
+        init_resp = await httpx_client.send(init_req, follow_redirects=False)
+        await init_resp.aread()
+        if init_resp.status_code not in (200, 201):
+            init_resp.raise_for_status()
+        session_url = init_resp.headers.get(session_url_header)
+        if not session_url:
+            raise ValueError(
+                f"resumable upload: no session URL in '{session_url_header}' header"
+            )
+
+        offset = 0
+        pending: Optional[bytes] = None
+        # Producing each chunk runs the synchronous per-row transform for that
+        # chunk's worth of rows. Pull it off the event loop thread so a large
+        # upload does not block other concurrent requests between PUTs.
+        chunk_iter = self._iter_resumable_chunks(stream.iter_bytes(), chunk_size)
+        done = object()
+        while True:
+            chunk = await asyncio.to_thread(next, chunk_iter, done)
+            if chunk is done:
+                break
+            if pending is not None:
+                await self._asend_resumable_chunk(
+                    httpx_client,
+                    session_url,
+                    base_headers,
+                    pending,
+                    offset,
+                    is_final=False,
+                    timeout=timeout,
+                )
+                offset += len(pending)
+            pending = chunk
+        return await self._asend_resumable_chunk(
+            httpx_client,
+            session_url,
+            base_headers,
+            pending or b"",
+            offset,
+            is_final=True,
+            timeout=timeout,
+        )
+
+    async def _asend_resumable_chunk(
+        self,
+        httpx_client: httpx.AsyncClient,
+        url: str,
+        base_headers: dict,
+        data: bytes,
+        offset: int,
+        *,
+        is_final: bool,
+        timeout: Optional[Union[float, httpx.Timeout]],
+    ) -> httpx.Response:
+        headers = {
+            **base_headers,
+            "Content-Range": self._resumable_content_range(offset, len(data), is_final),
+        }
+        req = httpx_client.build_request(
+            "PUT", url, **self._resumable_request_kwargs(headers, data, timeout)
+        )
+        resp = await httpx_client.send(req, follow_redirects=False)
+        await resp.aread()
+        if resp.status_code not in ((200, 201) if is_final else (308,)):
+            # 4xx/5xx raise here; the ValueError catches an unexpected success
+            # status (e.g. a 200 where the protocol expects a 308 between chunks).
+            resp.raise_for_status()
+            raise ValueError(f"resumable upload: unexpected status {resp.status_code}")
+        return resp
 
     def create_batch(
         self,
@@ -3945,6 +4294,18 @@ class BaseLLMHTTPHandler:
         )
         data = BaseResponsesAPIConfig.normalize_responses_api_request_dict(data)
 
+        headers, signed_body = responses_api_provider_config.sign_request(
+            headers=headers,
+            optional_params=dict(litellm_params),
+            request_data=data,
+            api_base=url,
+            api_key=litellm_params.api_key,
+            model=model,
+        )
+        body_kwargs: Dict[str, Any] = (
+            {"data": signed_body} if signed_body is not None else {"json": data}
+        )
+
         ## LOGGING
         logging_obj.pre_call(
             input=input,
@@ -3958,7 +4319,7 @@ class BaseLLMHTTPHandler:
 
         try:
             response = sync_httpx_client.post(
-                url=url, headers=headers, json=data, timeout=timeout
+                url=url, headers=headers, timeout=timeout, **body_kwargs
             )
 
         except Exception as e:
@@ -4028,6 +4389,18 @@ class BaseLLMHTTPHandler:
         )
         data = BaseResponsesAPIConfig.normalize_responses_api_request_dict(data)
 
+        headers, signed_body = responses_api_provider_config.sign_request(
+            headers=headers,
+            optional_params=dict(litellm_params),
+            request_data=data,
+            api_base=url,
+            api_key=litellm_params.api_key,
+            model=model,
+        )
+        body_kwargs: Dict[str, Any] = (
+            {"data": signed_body} if signed_body is not None else {"json": data}
+        )
+
         ## LOGGING
         logging_obj.pre_call(
             input=input,
@@ -4041,7 +4414,7 @@ class BaseLLMHTTPHandler:
 
         try:
             response = await async_httpx_client.post(
-                url=url, headers=headers, json=data, timeout=timeout
+                url=url, headers=headers, timeout=timeout, **body_kwargs
             )
 
         except Exception as e:
@@ -4592,6 +4965,51 @@ class BaseLLMHTTPHandler:
         return depth, max(max_loops, 1), fingerprints
 
     @staticmethod
+    def _has_agentic_completion_hook(logging_obj: Any) -> bool:
+        """
+        True if any registered callback actually overrides
+        ``async_should_run_agentic_loop`` (the gate every agentic hook goes
+        through). The base ``CustomLogger`` implementation returns
+        ``(False, {})``, so when nothing overrides it the agentic
+        post-processing is a guaranteed no-op and the streaming wrapper that
+        buffers + rebuilds the whole response from SSE just to call it can be
+        skipped entirely.
+
+        Function-identity comparison (not a leaf ``__dict__`` check) so an
+        override inherited through any intermediate class is still detected --
+        a false negative here would silently disable agentic features.
+
+        String entries in ``litellm.callbacks`` (e.g. ``"datadog"``) are
+        resolved to their ``CustomLogger`` instance via
+        ``get_custom_logger_compatible_class`` -- same pattern as
+        ``ProxyLogging._callback_capabilities`` -- so a string-registered
+        agentic callback is detected too.
+        """
+        from litellm.integrations.custom_logger import CustomLogger
+        from litellm.litellm_core_utils.litellm_logging import (
+            get_custom_logger_compatible_class,
+        )
+
+        base_func = CustomLogger.async_should_run_agentic_loop
+        callbacks = litellm.callbacks + (
+            getattr(logging_obj, "dynamic_success_callbacks", None) or []
+        )
+        for cb in callbacks:
+            if isinstance(cb, str):
+                resolved = get_custom_logger_compatible_class(cb)  # type: ignore[arg-type]
+                if resolved is None:
+                    continue
+                cb = resolved
+            if not isinstance(cb, CustomLogger):
+                continue
+            cb_func = getattr(type(cb), "async_should_run_agentic_loop", base_func)
+            if getattr(cb_func, "__func__", cb_func) is not getattr(
+                base_func, "__func__", base_func
+            ):
+                return True
+        return False
+
+    @staticmethod
     def _check_agentic_loop_safety(
         tool_calls: Any,
         fingerprints: List[str],
@@ -4639,6 +5057,7 @@ class BaseLLMHTTPHandler:
         fingerprints: List[str],
         fingerprint: str,
         stream: bool = False,
+        callback: Optional[Any] = None,
     ) -> Any:
         from litellm.anthropic_interface import messages as anthropic_messages
 
@@ -4680,7 +5099,7 @@ class BaseLLMHTTPHandler:
         kwargs_for_followup["max_agentic_loops"] = max_loops
         kwargs_for_followup["_agentic_loop_fingerprints"] = fingerprints + [fingerprint]
 
-        return await anthropic_messages.acreate(
+        response = await anthropic_messages.acreate(
             **{
                 "max_tokens": max_tokens,
                 "messages": patch.messages,
@@ -4690,6 +5109,23 @@ class BaseLLMHTTPHandler:
                 **kwargs_for_followup,
             }
         )
+
+        if callback is not None:
+            try:
+                response = await callback.async_post_agentic_loop_response_hook(
+                    response=response, plan=plan, kwargs=kwargs
+                )
+            except Exception as e:
+                _call_id = getattr(logging_obj, "litellm_call_id", "unknown")
+                verbose_logger.exception(
+                    "LiteLLM.AgenticHookError: Exception in "
+                    "async_post_agentic_loop_response_hook [call_id=%s model=%s]: %s",
+                    _call_id,
+                    model,
+                    str(e),
+                )
+
+        return response
 
     async def _execute_chat_completion_agentic_plan(
         self,
@@ -4874,6 +5310,7 @@ class BaseLLMHTTPHandler:
                     fingerprints=fingerprints,
                     fingerprint=fingerprint,
                     stream=stream,
+                    callback=callback,
                 )
             except Exception as e:
                 _call_id = getattr(logging_obj, "litellm_call_id", "unknown")
@@ -5199,6 +5636,28 @@ class BaseLLMHTTPHandler:
                 )
                 if _session_config:
                     realtime_streaming.session_configuration_request = _session_config
+
+                # For providers that defer setup until client session.update, optionally
+                # send synthetic session.created to unblock clients waiting on connect.
+                if not provider_config.requires_session_configuration():
+                    synthetic_session = provider_config.transform_session_created_event(
+                        model=model,
+                        logging_session_id=logging_obj.litellm_trace_id,
+                        session_configuration_request=None,
+                    )
+                    if synthetic_session is not None:
+                        synthetic_session_str = json.dumps(synthetic_session)
+                        # Record before sending so the synthetic session.created is
+                        # captured in the session log alongside provider-driven
+                        # events; without this it would be silently absent from
+                        # success_handler / async_success_handler payloads.
+                        realtime_streaming.store_message(synthetic_session_str)
+                        await websocket.send_text(synthetic_session_str)
+                        realtime_streaming._session_created_sent_to_client = True
+                        verbose_logger.debug(
+                            "Sent synthetic session.created to client to unblock connection"
+                        )
+
                 await realtime_streaming.bidirectional_forward()
 
         except websockets.exceptions.InvalidStatusCode as e:  # type: ignore
@@ -5260,7 +5719,6 @@ class BaseLLMHTTPHandler:
             headers = {
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
-                "OpenAI-Beta": "realtime=v1",
             }
 
         if extra_headers:
@@ -6422,6 +6880,7 @@ class BaseLLMHTTPHandler:
             api_key=api_key or litellm_params.get("api_key", None),
             headers=extra_headers or {},
             model="",
+            litellm_params=litellm_params,
         )
 
         if extra_headers:
@@ -6504,6 +6963,7 @@ class BaseLLMHTTPHandler:
             api_key=api_key or litellm_params.get("api_key", None),
             headers=extra_headers or {},
             model="",
+            litellm_params=litellm_params,
         )
 
         if extra_headers:
@@ -6596,6 +7056,7 @@ class BaseLLMHTTPHandler:
             api_key=api_key or litellm_params.get("api_key", None),
             headers=extra_headers or {},
             model="",
+            litellm_params=litellm_params,
         )
         if extra_headers:
             headers.update(extra_headers)
@@ -6667,6 +7128,7 @@ class BaseLLMHTTPHandler:
             api_key=api_key or litellm_params.get("api_key", None),
             headers=extra_headers or {},
             model="",
+            litellm_params=litellm_params,
         )
         if extra_headers:
             headers.update(extra_headers)
@@ -6750,6 +7212,7 @@ class BaseLLMHTTPHandler:
             api_key=api_key or litellm_params.get("api_key", None),
             headers=extra_headers or {},
             model="",
+            litellm_params=litellm_params,
         )
         if extra_headers:
             headers.update(extra_headers)
@@ -6807,6 +7270,7 @@ class BaseLLMHTTPHandler:
             api_key=api_key or litellm_params.get("api_key", None),
             headers=extra_headers or {},
             model="",
+            litellm_params=litellm_params,
         )
         if extra_headers:
             headers.update(extra_headers)
@@ -6883,6 +7347,7 @@ class BaseLLMHTTPHandler:
             api_key=api_key or litellm_params.get("api_key", None),
             headers=extra_headers or {},
             model="",
+            litellm_params=litellm_params,
         )
         if extra_headers:
             headers.update(extra_headers)
@@ -6893,27 +7358,49 @@ class BaseLLMHTTPHandler:
             litellm_params=dict(litellm_params),
         )
 
-        url, data = video_provider_config.transform_video_edit_request(
-            prompt=prompt,
+        prefetched_source_data = None
+        prefetch_params = video_provider_config.get_video_edit_prefetch_params(
             video_id=video_id,
             api_base=api_base,
             litellm_params=litellm_params,
             headers=headers,
-            extra_body=extra_body,
         )
-
-        logging_obj.pre_call(
-            input=prompt,
-            api_key="",
-            additional_args={
-                "complete_input_dict": data,
-                "api_base": url,
-                "headers": headers,
-                "video_id": video_id,
-            },
-        )
+        if prefetch_params is not None:
+            prefetch_url, prefetch_body = prefetch_params
+            try:
+                prefetch_resp = sync_httpx_client.post(
+                    url=prefetch_url,
+                    headers=headers,
+                    json=prefetch_body,
+                    timeout=timeout,
+                )
+                prefetch_resp.raise_for_status()
+            except Exception as e:
+                raise self._handle_error(e=e, provider_config=video_provider_config)
+            prefetched_source_data = prefetch_resp.json()
 
         try:
+            url, data = video_provider_config.transform_video_edit_request(
+                prompt=prompt,
+                video_id=video_id,
+                api_base=api_base,
+                litellm_params=litellm_params,
+                headers=headers,
+                extra_body=extra_body,
+                prefetched_source_data=prefetched_source_data,
+            )
+
+            logging_obj.pre_call(
+                input=prompt,
+                api_key="",
+                additional_args={
+                    "complete_input_dict": data,
+                    "api_base": url,
+                    "headers": headers,
+                    "video_id": video_id,
+                },
+            )
+
             response = sync_httpx_client.post(
                 url=url,
                 headers=headers,
@@ -6925,6 +7412,7 @@ class BaseLLMHTTPHandler:
                 raw_response=response,
                 logging_obj=logging_obj,
                 custom_llm_provider=custom_llm_provider,
+                request_data=data,
             )
         except Exception as e:
             raise self._handle_error(e=e, provider_config=video_provider_config)
@@ -6955,6 +7443,7 @@ class BaseLLMHTTPHandler:
             api_key=api_key or litellm_params.get("api_key", None),
             headers=extra_headers or {},
             model="",
+            litellm_params=litellm_params,
         )
         if extra_headers:
             headers.update(extra_headers)
@@ -6965,27 +7454,49 @@ class BaseLLMHTTPHandler:
             litellm_params=dict(litellm_params),
         )
 
-        url, data = video_provider_config.transform_video_edit_request(
-            prompt=prompt,
+        prefetched_source_data = None
+        prefetch_params = video_provider_config.get_video_edit_prefetch_params(
             video_id=video_id,
             api_base=api_base,
             litellm_params=litellm_params,
             headers=headers,
-            extra_body=extra_body,
         )
-
-        logging_obj.pre_call(
-            input=prompt,
-            api_key="",
-            additional_args={
-                "complete_input_dict": data,
-                "api_base": url,
-                "headers": headers,
-                "video_id": video_id,
-            },
-        )
+        if prefetch_params is not None:
+            prefetch_url, prefetch_body = prefetch_params
+            try:
+                prefetch_resp = await async_httpx_client.post(
+                    url=prefetch_url,
+                    headers=headers,
+                    json=prefetch_body,
+                    timeout=timeout,
+                )
+                prefetch_resp.raise_for_status()
+            except Exception as e:
+                raise self._handle_error(e=e, provider_config=video_provider_config)
+            prefetched_source_data = prefetch_resp.json()
 
         try:
+            url, data = video_provider_config.transform_video_edit_request(
+                prompt=prompt,
+                video_id=video_id,
+                api_base=api_base,
+                litellm_params=litellm_params,
+                headers=headers,
+                extra_body=extra_body,
+                prefetched_source_data=prefetched_source_data,
+            )
+
+            logging_obj.pre_call(
+                input=prompt,
+                api_key="",
+                additional_args={
+                    "complete_input_dict": data,
+                    "api_base": url,
+                    "headers": headers,
+                    "video_id": video_id,
+                },
+            )
+
             response = await async_httpx_client.post(
                 url=url,
                 headers=headers,
@@ -6997,6 +7508,7 @@ class BaseLLMHTTPHandler:
                 raw_response=response,
                 logging_obj=logging_obj,
                 custom_llm_provider=custom_llm_provider,
+                request_data=data,
             )
         except Exception as e:
             raise self._handle_error(e=e, provider_config=video_provider_config)
@@ -7044,6 +7556,7 @@ class BaseLLMHTTPHandler:
             api_key=api_key or litellm_params.get("api_key", None),
             headers=extra_headers or {},
             model="",
+            litellm_params=litellm_params,
         )
         if extra_headers:
             headers.update(extra_headers)
@@ -7118,6 +7631,7 @@ class BaseLLMHTTPHandler:
             api_key=api_key or litellm_params.get("api_key", None),
             headers=extra_headers or {},
             model="",
+            litellm_params=litellm_params,
         )
         if extra_headers:
             headers.update(extra_headers)
@@ -7329,6 +7843,7 @@ class BaseLLMHTTPHandler:
             api_key=api_key,
             headers=extra_headers or {},
             model="",
+            litellm_params=litellm_params,
         )
 
         if extra_headers:
@@ -7821,7 +8336,7 @@ class BaseLLMHTTPHandler:
             response = sync_httpx_client.get(
                 url=url,
                 headers=headers,
-                params=params,
+                params=params or None,
             )
 
             return container_provider_config.transform_container_list_response(
@@ -7898,7 +8413,7 @@ class BaseLLMHTTPHandler:
             response = await async_httpx_client.get(
                 url=url,
                 headers=headers,
-                params=params,
+                params=params or None,
             )
 
             return container_provider_config.transform_container_list_response(
@@ -7988,7 +8503,7 @@ class BaseLLMHTTPHandler:
             response = sync_httpx_client.get(
                 url=url,
                 headers=headers,
-                params=params,
+                params=params or None,
             )
 
             return container_provider_config.transform_container_retrieve_response(
@@ -8065,7 +8580,7 @@ class BaseLLMHTTPHandler:
             response = await async_httpx_client.get(
                 url=url,
                 headers=headers,
-                params=params,
+                params=params or None,
             )
 
             return container_provider_config.transform_container_retrieve_response(
@@ -8155,7 +8670,7 @@ class BaseLLMHTTPHandler:
             response = sync_httpx_client.delete(
                 url=url,
                 headers=headers,
-                params=params,
+                params=params or None,
             )
 
             return container_provider_config.transform_container_delete_response(
@@ -8232,7 +8747,7 @@ class BaseLLMHTTPHandler:
             response = await async_httpx_client.delete(
                 url=url,
                 headers=headers,
-                params=params,
+                params=params or None,
             )
 
             return container_provider_config.transform_container_delete_response(
@@ -8328,7 +8843,7 @@ class BaseLLMHTTPHandler:
             response = sync_httpx_client.get(
                 url=url,
                 headers=headers,
-                params=params,
+                params=params or None,
             )
 
             return container_provider_config.transform_container_file_list_response(
@@ -8407,7 +8922,7 @@ class BaseLLMHTTPHandler:
             response = await async_httpx_client.get(
                 url=url,
                 headers=headers,
-                params=params,
+                params=params or None,
             )
 
             return container_provider_config.transform_container_file_list_response(
@@ -8495,7 +9010,7 @@ class BaseLLMHTTPHandler:
             response = sync_httpx_client.get(
                 url=url,
                 headers=headers,
-                params=params,
+                params=params or None,
             )
 
             return container_provider_config.transform_container_file_content_response(
@@ -8571,7 +9086,7 @@ class BaseLLMHTTPHandler:
             response = await async_httpx_client.get(
                 url=url,
                 headers=headers,
-                params=params,
+                params=params or None,
             )
 
             return container_provider_config.transform_container_file_content_response(
