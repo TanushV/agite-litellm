@@ -314,8 +314,12 @@ def test_chunk_parser_function_call_added_produces_tool_use():
 
     chunk = {
         "type": ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED,
-        "arguments": '{"key": "value"}',
-        "item": {"type": "function_call", "name": "fn", "call_id": "call-42"},
+        "item": {
+            "type": "function_call",
+            "name": "fn",
+            "call_id": "call-42",
+            "arguments": '{"key": "value"}',
+        },
     }
 
     result = iterator.chunk_parser(chunk)

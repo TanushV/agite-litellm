@@ -56,3 +56,23 @@ from agite.1 is limited to `base_model_iterator.py` and `llm_http_handler.py`.
 Run `tests/test_litellm/llms/custom_httpx/test_response_ownership.py` for closure
 before and after the first chunk; the runtime also tests actual loopback HTTP
 streams, cancellation, inactivity and observed versus synthetic status codes.
+
+## 1.84.0+agite.3: completed Responses function arguments
+
+The existing Responses-to-Chat stream iterator now retains argument progress
+per output index. A provider may deliver complete function arguments in
+`response.function_call_arguments.done` without any argument delta events.
+Previously those valid arguments were discarded, leaving empty tool calls.
+The translator emits only the unseen suffix of completed arguments, checks
+that already-streamed text is a prefix, and does not repeat call identity or
+end the response prematurely. Arguments on the initial function item are read
+from that item, matching the native event schema.
+
+This is a provider-neutral stream translation fix. There is no new retry loop,
+runtime patch, model special case or change to HTTP/credential ownership.
+Regression cases cover complete-only and mixed streams, interleaved calls,
+Unicode, conflicting completions, absent optional snapshots and stream isolation.
+Run `tests/test_litellm/completion_extras/litellm_responses_transformation/`
+alongside the existing ChatGPT and response-ownership suites before release.
+
+Protocol reference: https://developers.openai.com/api/reference/resources/responses/streaming-events
