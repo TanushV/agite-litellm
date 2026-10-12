@@ -278,6 +278,11 @@ class OpenRouterChatCompletionStreamingHandler(BaseModelResponseIterator):
 
             new_choices = []
             for choice in chunk["choices"]:
+                # A partially emitted tool call is not a completed response.
+                # OpenRouter may label it tool_calls while retaining the
+                # provider's actual truncation reason in native_finish_reason.
+                if choice.get("native_finish_reason") == "length":
+                    choice["finish_reason"] = "length"
                 choice["delta"]["reasoning_content"] = choice["delta"].get("reasoning")
                 new_choices.append(choice)
             return ModelResponseStream(

@@ -76,3 +76,15 @@ Run `tests/test_litellm/completion_extras/litellm_responses_transformation/`
 alongside the existing ChatGPT and response-ownership suites before release.
 
 Protocol reference: https://developers.openai.com/api/reference/resources/responses/streaming-events
+
+## 1.84.0+agite.4: OpenRouter output-limit termination
+
+OpenRouter can normalize a truncated function call to `tool_calls` while
+reporting `native_finish_reason: length`. The existing OpenRouter stream
+translator now preserves that explicit capacity stop as `length` in the
+normalized finish reason. Ordinary completed tool calls retain their existing
+reason. No retries, token limits or provider routing change in the SDK.
+
+Six parser cases plus the consumer's real HTTP/SDK integration tests cover
+truncation, successful tool calls, untouched syntax failures and final usage.
+Protocol reference: https://github.com/OpenRouterTeam/docs/blob/main/api_reference/streaming.mdx
