@@ -17,6 +17,30 @@ from litellm.llms.openrouter.chat.transformation import (
 
 
 class TestOpenRouterChatCompletionStreamingHandler:
+    @pytest.mark.parametrize(
+        ("normalized", "native", "expected"),
+        [
+            ("tool_calls", "length", "length"),
+            ("stop", "length", "length"),
+            ("length", "length", "length"),
+            ("tool_calls", "stop", "tool_calls"),
+            ("tool_calls", None, "tool_calls"),
+            ("stop", "stop", "stop"),
+        ],
+    )
+    def test_native_length_is_not_hidden_by_tool_call_normalization(
+        self, normalized, native, expected
+    ):
+        handler = OpenRouterChatCompletionStreamingHandler(None, sync_stream=True)
+        result = handler.chunk_parser({
+            "id": "gen-output-limit", "created": 1, "model": "fixture",
+            "choices": [{"index": 0, "delta": {},
+                "finish_reason": normalized, "native_finish_reason": native}],
+            "usage": {"prompt_tokens": 13, "completion_tokens": 128},
+        })
+        assert result.choices[0].finish_reason == expected
+        assert result.usage.completion_tokens == 128
+
     def test_chunk_parser_successful(self):
         handler = OpenRouterChatCompletionStreamingHandler(
             streaming_response=None, sync_stream=True
