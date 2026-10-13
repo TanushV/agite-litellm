@@ -67,3 +67,19 @@ patch provenance; this release must be audited as upstream `litellm==1.88.6`.
 The upstream Python support bound is preserved: Python 3.10 through 3.13.
 
 Source: https://github.com/BerriAI/litellm/security/advisories/GHSA-3cv6-jpf6-8222
+
+## 1.88.6+agite.3: preserve completed arguments and output limits
+
+Carries the completed Responses function-argument and native OpenRouter output-limit
+fixes from 1.84.0+agite.4 onto the 1.88.6 security baseline, retaining agite.2's
+streamed provider-cost accounting. Completed argument snapshots supply only the
+missing suffix; inconsistent prefixes fail instead of silently corrupting a call.
+An explicit native `length` finish remains a capacity stop even when the provider's
+normalized reason is `tool_calls`. Neither change alters the configured limit,
+model route, credentials, or retry policy.
+
+The focused Responses and OpenRouter regression suites cover complete-only,
+partial, interleaved, Unicode, absent and conflicting argument events and native
+finish reasons. Runtime loopback HTTP checks exercise the installed wheel. The
+existing model-catalog-dependent reasoning-support test remains outside this
+transport verification; no paid provider run is claimed.
