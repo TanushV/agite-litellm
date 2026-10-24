@@ -83,3 +83,11 @@ partial, interleaved, Unicode, absent and conflicting argument events and native
 finish reasons. Runtime loopback HTTP checks exercise the installed wheel. The
 existing model-catalog-dependent reasoning-support test remains outside this
 transport verification; no paid provider run is claimed.
+
+## 1.88.6+agite.4: secure file-lock dependency
+
+Raises the direct filelock dependency to `>=4.2.1,<5.0`, allowing the patched
+release without overriding dependency resolution in downstream applications.
+All credential, transport, usage and streaming code is unchanged.
+The supported Python floor is now 3.11 because filelock 4 requires it. Agite
+production already uses Python 3.12.
