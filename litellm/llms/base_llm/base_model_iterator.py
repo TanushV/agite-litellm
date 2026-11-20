@@ -1,4 +1,5 @@
 import json
+import httpx
 from abc import abstractmethod
 from typing import TYPE_CHECKING, List, Optional, Union, cast
 
@@ -73,13 +74,20 @@ class BaseModelResponseIterator:
     async def aclose(self) -> None:
         """Close the upstream HTTP response so the provider connection is
         released (and a backend like vLLM aborts generation) when the stream
-        is abandoned before its natural end.
+        is abandoned before its natural end, even if the line iterator never
+        started.
 
         ``streaming_response`` is usually a bare ``aiter_lines()`` generator
         that holds no reference to the response, so the handler that owns the
         response attaches it here after construction."""
-        if self.http_response is not None:
-            await self.http_response.aclose()
+        try:
+            close = getattr(self.streaming_response, "aclose", None)
+            if close is not None:
+                await close()
+        finally:
+            if self.http_response is not None:
+                await self.http_response.aclose()
+
 
     def chunk_parser(self, chunk: dict) -> Union[GenericStreamingChunk, ModelResponseStream]:
         return GenericStreamingChunk(
