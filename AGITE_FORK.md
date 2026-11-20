@@ -1,0 +1,125 @@
+# Maintained credential and HTTP stream lifecycle
+
+This is an explicit MIT-licensed fork of BerriAI/LiteLLM. The current version,
+`1.103.11+agite.1`, is based on upstream `v1.103.11` and retains the maintained
+headless ChatGPT credential, HTTP response-ownership and completed-argument
+fixes below. `filelock` remains
+a direct dependency. All upstream attribution remains.
+
+## Operational contract
+
+Set `CHATGPT_NON_INTERACTIVE=true` in unattended processes. Keep one dedicated
+session per deployed cache; do not copy a desktop session that another machine
+will continue refreshing. Revocation requires explicit operator reauthorization.
+This fork is not an OpenAI-supported authentication integration.
+
+`CHATGPT_TOKEN_DIR` selects a dedicated private directory; `CHATGPT_AUTH_FILE`
+selects one filename inside it (default `auth.json`). The directory must be on a
+persistent local filesystem and writable by the process. The authenticator
+enforces directory mode 0700 and file/lock mode 0600. It serializes reads,
+refreshes and writes across processes, with a 60-second lock timeout and a
+30-second refresh HTTP timeout. Refreshed tokens are flushed and atomically
+replaced before use. Disk failure is an authentication failure, not permission
+to continue with an unpersisted rotating credential.
+
+The native Responses transport still constructs this canonical authenticator.
+There is no alternate agent loop or runtime patch. Explicit constructor options
+for directory, filename, interactivity, HTTP client and lock timeout support
+embedded use and isolated transport tests. All credentials remain in the
+existing LiteLLM flat JSON format; no desktop-cache converter is included.
+
+## Verification and maintenance
+
+Run `python -m pytest -q tests/test_litellm/llms/chatgpt`. These tests use
+disposable credentials, the real filesystem, subprocesses and HTTP transports;
+they do not patch production methods. Audit both the fork's complete dependency
+resolution and upstream `litellm==1.88.6`: PyPI advisory lookup does not recognize
+local fork versions or URL requirements. A skipped fork is not an audit pass.
+Rebase only after rerunning lifecycle and native Responses regression tests.
+
+Build with `python agite/build_wheel.py <upstream wheel> <its sha256> <base tag>
+<out dir>` (see 1.95.0+agite.1). Install a released wheel using its SHA256 hash,
+never a moving Git branch or a startup edit of site-packages.
+
+## 1.84.0+agite.2: streamed response ownership
+
+The async HTTP chat transport transfers ownership of the open HTTP response to
+its base model iterator. `aclose()` closes both the line iterator and the response,
+including when no chunk was consumed. Construction failures close the response
+before propagating the error. The outer CustomStreamWrapper already delegates
+closure to the inner iterator; callers must close streams in a `finally` block.
+
+This fixes early timeout and cancellation leaving connections acquired on the
+OpenRouter HTTP transport. It does not introduce retries, alter provider routing,
+close clients during cache eviction or replace the transport. The shipped delta
+from agite.1 is limited to `base_model_iterator.py` and `llm_http_handler.py`.
+
+Run `tests/test_litellm/llms/custom_httpx/test_response_ownership.py` for closure
+before and after the first chunk; the runtime also tests actual loopback HTTP
+streams, cancellation, inactivity and observed versus synthetic status codes.
+
+## 1.88.6+agite.1: upstream security baseline
+
+Rebased the maintained credential and response-ownership changes onto upstream
+`v1.88.6` (`b504a0eeb6f8a26daae3a2ebca12ccc2cacd3a2f`). This includes the upstream
+fix for GHSA-3cv6-jpf6-8222 (PYSEC-2026-4066), covering unvalidated proxy routing
+and credential parameters. The prior 1.84 sections above record historical
+patch provenance; this release must be audited as upstream `litellm==1.88.6`.
+The upstream Python support bound is preserved: Python 3.10 through 3.13.
+
+Source: https://github.com/BerriAI/litellm/security/advisories/GHSA-3cv6-jpf6-8222
+
+## 1.88.6+agite.3: preserve completed arguments and output limits
+
+Carries the completed Responses function-argument and native OpenRouter output-limit
+fixes from 1.84.0+agite.4 onto the 1.88.6 security baseline, retaining agite.2's
+streamed provider-cost accounting. Completed argument snapshots supply only the
+missing suffix; inconsistent prefixes fail instead of silently corrupting a call.
+An explicit native `length` finish remains a capacity stop even when the provider's
+normalized reason is `tool_calls`. Neither change alters the configured limit,
+model route, credentials, or retry policy.
+
+The focused Responses and OpenRouter regression suites cover complete-only,
+partial, interleaved, Unicode, absent and conflicting argument events and native
+finish reasons. Runtime loopback HTTP checks exercise the installed wheel. The
+existing model-catalog-dependent reasoning-support test remains outside this
+transport verification; no paid provider run is claimed.
+
+## 1.88.6+agite.4: secure file-lock dependency
+
+Raises the direct filelock dependency to `>=4.2.1,<5.0`, allowing the patched
+release without overriding dependency resolution in downstream applications.
+All credential, transport, usage and streaming code is unchanged.
+The supported Python floor is now 3.11 because filelock 4 requires it. Agite
+production already uses Python 3.12.
+
+## 1.103.11+agite.1: upstream 1.103.11
+
+Rebased onto upstream `v1.103.11`. Upstream 1.95.x still carries
+GHSA-7hp6-4w63-5g45 and 1.95.0 also PYSEC-2026-4066 (both proxy-server only;
+Agite runs no proxy); 1.103.11 has no known advisory and is a maintained line.
+Audit this release as upstream `litellm==1.103.11`.
+
+- Upstream now preserves provider-reported streamed costs, so agite.2's cost
+  change and its tests are dropped in favour of upstream's own.
+- Upstream now hands the open HTTP response to the stream iterator; the fork
+  keeps closing the line iterator first and closing the response when
+  construction fails.
+- The headless ChatGPT authenticator is the fork's file whole: upstream's
+  1.95 to 1.103 changes there are typing only, and the fork keeps the
+  cross-process lock, atomic persisted writes and non-interactive failure.
+  Upstream's device-code cooldown still applies to interactive login.
+- Completed function arguments still supply only the missing suffix; upstream
+  still drops arguments that arrive only on the final events. The fork's
+  fixtures use opaque call IDs, as real streams do, because upstream treats a
+  `call_<n>` ID as degenerate and prefers the item ID.
+- Upstream 1.100 and later depend on boto3 and pydantic-settings at import.
+
+Upstream ships platform wheels with an optional Rust extension that LiteLLM
+loads only when present. Agite needs one wheel for every platform, so
+`agite/build_wheel.py` takes upstream's published `abi3 manylinux x86_64` wheel
+(checked against its PyPI digest), applies this branch's `litellm/` changes,
+writes the fork's own runtime requirements, drops the native module and
+writes a `py3-none-any` wheel. Its package data is upstream's own. Without the
+extension, the OCR, Bedrock transcription and Responses WebSocket bridges
+report themselves unavailable; Agite uses none of them.

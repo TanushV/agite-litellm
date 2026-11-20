@@ -1386,6 +1386,8 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
         super().__init__(streaming_response, sync_stream, json_mode)
         self._chat_completion_id: str | None = None
         self._tool_call_index_map: dict[int, int] = {}  # mutable-ok: per-stream accumulator state
+        # mutable-ok: per-stream argument text by output index
+        self._function_arguments: dict[int, str] = {}
 
     def _handle_string_chunk(
         self, str_line: Union[str, "BaseModel"]
@@ -1690,6 +1692,49 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
             ModelResponseStream: OpenAI-formatted streaming chunk
         """
         verbose_logger.debug("Chat provider: transform_streaming_response called with chunk: %s", chunk)
+        event_type = chunk.get("type")
+        index = chunk.get("output_index", 0)
+        item = chunk.get("item", {})
+        if (
+            event_type == "response.output_item.added"
+            and item.get("type") == "function_call"
+        ):
+            self._function_arguments[index] = item.get("arguments", "")
+        elif event_type == "response.function_call_arguments.delta":
+            self._function_arguments[index] = self._function_arguments.get(
+                index, ""
+            ) + chunk.get("delta", "")
+        elif index in self._function_arguments and (
+            (
+                event_type == "response.function_call_arguments.done"
+                and "arguments" in chunk
+            )
+            or (
+                event_type == "response.output_item.done"
+                and item.get("type") == "function_call"
+                and "arguments" in item
+            )
+        ):
+            # Some Responses streams supply only the completed arguments. Emit
+            # the unseen suffix, never the already-forwarded delta prefix.
+            complete = (
+                chunk.get("arguments", "")
+                if event_type == "response.function_call_arguments.done"
+                else item.get("arguments", "")
+            )
+            emitted = self._function_arguments.get(index, "")
+            if not complete.startswith(emitted):
+                raise ValueError(
+                    "Completed function arguments contradict the streamed prefix"
+                )
+            suffix = complete[len(emitted) :]
+            self._function_arguments[index] = complete
+            if suffix:
+                chunk = {
+                    "type": "response.function_call_arguments.delta",
+                    "output_index": index,
+                    "delta": suffix,
+                }
         return self._with_stream_scoped_id(
             OpenAiResponsesToChatCompletionStreamIterator.translate_responses_chunk_to_openai_stream(
                 chunk, tool_call_index_map=self._tool_call_index_map
